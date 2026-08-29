@@ -11,13 +11,34 @@ ACCOUNTS_FILE = DATA_DIR / "gemini_accounts.json"
 
 
 def parse_cookie_header(value: str) -> dict[str, str]:
-    return {
-        name.strip(): cookie.strip()
-        for part in value.split(";")
-        if "=" in part
-        for name, cookie in [part.strip().split("=", 1)]
-        if name.strip() and cookie.strip()
-    }
+    raw = value.strip()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("cookies", parsed.get("cookie", parsed))
+        if isinstance(parsed, dict):
+            return {str(k).removeprefix("HttpOnly_"): str(v) for k, v in parsed.items() if v}
+        if isinstance(parsed, list):
+            return {str(item.get("name", "")).removeprefix("HttpOnly_"): str(item.get("value", ""))
+                    for item in parsed if isinstance(item, dict) and item.get("name") and item.get("value")}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    cookies: dict[str, str] = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:  # Netscape cookies.txt: domain, flags, path, secure, expiry, name, value
+            pairs = [(parts[5], parts[6])]
+        else:
+            pairs = [part.split("=", 1) for part in line.split(";") if "=" in part]
+        for name, cookie in pairs:
+            name = name.strip().removeprefix("HttpOnly_")
+            if name and cookie.strip():
+                cookies[name] = cookie.strip()
+    return cookies
 
 
 class GeminiAccountService:
@@ -46,7 +67,8 @@ class GeminiAccountService:
         psid = cookies.get("__Secure-1PSID")
         if not psid:
             raise ValueError("Gemini Cookie 中缺少 __Secure-1PSID")
-        account = {"name": name.strip() or f"gemini-{int(time.time())}", "cookie": cookie.strip(),
+        normalized_cookie = "; ".join(f"{key}={value}" for key, value in cookies.items())
+        account = {"name": name.strip() or f"gemini-{int(time.time())}", "cookie": normalized_cookie,
                    "psid": psid, "psidts": cookies.get("__Secure-1PSIDTS", ""), "proxy": proxy.strip(),
                    "status": "active", "inflight": 0, "cooldown_until": 0, "failure_count": 0,
                    "error_message": ""}
