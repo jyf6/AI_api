@@ -26,6 +26,16 @@ def test_cookie_header_with_equals_and_special_characters_is_parsed():
     assert cookies["SAPISID"] == "a/b"
 
 
+def test_gemini_account_requires_psidts(monkeypatch, tmp_path):
+    monkeypatch.setattr("services.gemini_account_service.ACCOUNTS_FILE", tmp_path / "gemini_accounts.json")
+    service = GeminiAccountService()
+    try:
+        service.add_account("missing-ts", "__Secure-1PSID=psid")
+        assert False
+    except ValueError as exc:
+        assert "PSIDTS" in str(exc)
+
+
 def test_gemini_image_alias_maps_to_registered_runtime_model():
     from services.gemini_backend_api import _runtime_model
 

@@ -483,7 +483,7 @@ HTML_DASHBOARD_PAGE = """<!DOCTYPE html>
       <div class="card-title"><span>Gemini Web Cookie 账号</span><button class="btn btn-sm btn-primary" onclick="fetchGeminiAccounts()">刷新</button></div>
       <form onsubmit="handleGeminiAccount(event)" style="display:flex;gap:10px;flex-wrap:wrap;">
         <input id="gemini-name" class="form-control" placeholder="账号名称" style="flex:1;min-width:150px;">
-        <input id="gemini-cookie" class="form-control" placeholder="粘贴 Gemini 完整 Cookie（含 __Secure-1PSID）" required style="flex:3;min-width:300px;">
+        <input id="gemini-cookie" class="form-control" placeholder="粘贴 Gemini 完整 Cookie（含 __Secure-1PSID 与 __Secure-1PSIDTS）" required style="flex:3;min-width:300px;">
         <input id="gemini-proxy" class="form-control" placeholder="代理（选填）" style="flex:1.5;min-width:180px;">
         <button class="btn btn-success" type="submit">录入 Gemini 账号</button>
       </form>

@@ -67,9 +67,12 @@ class GeminiAccountService:
         psid = cookies.get("__Secure-1PSID")
         if not psid:
             raise ValueError("Gemini Cookie 中缺少 __Secure-1PSID")
+        psidts = cookies.get("__Secure-1PSIDTS")
+        if not psidts:
+            raise ValueError("Gemini Cookie 中缺少 __Secure-1PSIDTS，请粘贴完整 Cookie Header")
         normalized_cookie = "; ".join(f"{key}={value}" for key, value in cookies.items())
         account = {"name": name.strip() or f"gemini-{int(time.time())}", "cookie": normalized_cookie,
-                   "psid": psid, "psidts": cookies.get("__Secure-1PSIDTS", ""), "proxy": proxy.strip(),
+                   "psid": psid, "psidts": psidts, "proxy": proxy.strip(),
                    "status": "active", "inflight": 0, "cooldown_until": 0, "failure_count": 0,
                    "error_message": ""}
         with self._lock:
