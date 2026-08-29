@@ -24,3 +24,10 @@ def test_cookie_header_with_equals_and_special_characters_is_parsed():
     cookies = parse_cookie_header("SID=g.a/x=y; __Secure-1PSID=g.a/x=y; SAPISID=a/b; __Secure-1PSIDTS=sidts-x_y")
     assert cookies["__Secure-1PSID"] == "g.a/x=y"
     assert cookies["SAPISID"] == "a/b"
+
+
+def test_gemini_image_alias_maps_to_registered_runtime_model():
+    from services.gemini_backend_api import _runtime_model
+
+    assert _runtime_model("gemini-2.5-pro-image") == "gemini-pro"
+    assert _runtime_model("gemini-3-flash") == "gemini-3-flash"

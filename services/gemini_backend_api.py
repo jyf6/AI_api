@@ -33,7 +33,7 @@ class GeminiBackendAPI:
 
     async def chat(self, messages: list[dict[str, Any]], model: str) -> str:
         prompt, files = _messages_to_prompt_and_files(messages)
-        output = await self.client.generate_content(prompt, files=files or None, model=model)
+        output = await self.client.generate_content(prompt, files=files or None, model=_runtime_model(model))
         text = (output.candidates[output.chosen].text if output.candidates else "")
         if not text:
             text = getattr(output, "text", "") or ""
@@ -43,7 +43,7 @@ class GeminiBackendAPI:
 
     async def image(self, prompt: str, model: str, references: list[str] | None = None) -> list[bytes]:
         files = [_data_url_to_bytes(value) for value in (references or [])]
-        output = await self.client.generate_content(prompt, files=files or None, model=model)
+        output = await self.client.generate_content(prompt, files=files or None, model=_runtime_model(model))
         images = list(output.candidates[output.chosen].generated_images if output.candidates else [])
         if not images:
             raise RuntimeError((getattr(output, "text", "") or "Gemini returned no image").strip())
@@ -54,6 +54,15 @@ class GeminiBackendAPI:
 def _cookie_dict(raw: str) -> dict[str, str]:
     return {part.split("=", 1)[0].strip(): part.split("=", 1)[1].strip()
             for part in raw.split(";") if "=" in part}
+
+
+def _runtime_model(model: str) -> str:
+    """Map UI/API aliases to names accepted by the installed Gemini Web client."""
+    aliases = {
+        "gemini-2.5-pro-image": "gemini-pro",
+        "gemini-2.5-flash-image": "gemini-flash",
+    }
+    return aliases.get(model, model)
 
 
 def _data_url_to_bytes(value: str) -> io.BytesIO:
