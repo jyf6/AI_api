@@ -26,8 +26,7 @@ class GeminiBackendAPI:
     async def __aexit__(self, *_args):
         if self.client:
             from services.gemini_account_service import gemini_account_service
-            cookie = "; ".join(f"{key}={value}" for key, value in self.client.cookies.items())
-            gemini_account_service.update_cookie(self.account["name"], cookie)
+            gemini_account_service.merge_cookie(self.account["name"], dict(self.client.cookies))
             await self.client.close()
         self.client = None
 

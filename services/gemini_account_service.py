@@ -106,6 +106,18 @@ class GeminiAccountService:
                 self._accounts[name]["psidts"] = parsed.get("__Secure-1PSIDTS", self._accounts[name].get("psidts", ""))
                 self._save()
 
+    def merge_cookie(self, name: str, updates: dict[str, str]) -> None:
+        with self._lock:
+            account = self._accounts.get(name)
+            if not account or not updates:
+                return
+            merged = parse_cookie_header(account.get("cookie", ""))
+            merged.update({key: value for key, value in updates.items() if value})
+            account["cookie"] = "; ".join(f"{key}={value}" for key, value in merged.items())
+            account["psid"] = merged.get("__Secure-1PSID", account.get("psid", ""))
+            account["psidts"] = merged.get("__Secure-1PSIDTS", account.get("psidts", ""))
+            self._save()
+
     def get_available_account(self) -> dict[str, Any]:
         now = int(time.time())
         with self._lock:

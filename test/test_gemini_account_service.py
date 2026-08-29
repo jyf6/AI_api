@@ -36,6 +36,17 @@ def test_gemini_account_requires_psidts(monkeypatch, tmp_path):
         assert "PSIDTS" in str(exc)
 
 
+def test_merge_cookie_keeps_original_full_cookie(monkeypatch, tmp_path):
+    monkeypatch.setattr("services.gemini_account_service.ACCOUNTS_FILE", tmp_path / "gemini_accounts.json")
+    service = GeminiAccountService()
+    service.add_account("main", "SID=sid; SAPISID=sapi; __Secure-1PSID=psid; __Secure-1PSIDTS=ts")
+    service.merge_cookie("main", {"AEC": "new", "__Secure-ENID": "enid"})
+    account = service._accounts["main"]
+    assert "SID=sid" in account["cookie"]
+    assert "SAPISID=sapi" in account["cookie"]
+    assert "AEC=new" in account["cookie"]
+
+
 def test_gemini_image_alias_maps_to_registered_runtime_model():
     from services.gemini_backend_api import _runtime_model
 
