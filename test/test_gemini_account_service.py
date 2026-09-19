@@ -47,8 +47,13 @@ def test_merge_cookie_keeps_original_full_cookie(monkeypatch, tmp_path):
     assert "AEC=new" in account["cookie"]
 
 
-def test_gemini_image_alias_maps_to_registered_runtime_model():
-    from services.gemini_backend_api import _runtime_model
+def test_imported_gemini_cookies_are_bound_to_google_domain():
+    from providers.gemini.webapi import GeminiClient
+    from services.gemini_account_service import parse_cookie_header
 
-    assert _runtime_model("gemini-2.5-pro-image") == "gemini-pro"
-    assert _runtime_model("gemini-3-flash") == "gemini-3-flash"
+    client = GeminiClient("psid", "psidts")
+    client.cookies = parse_cookie_header(
+        "SID=sid; SAPISID=sapisid; __Secure-1PSID=psid; __Secure-1PSIDTS=psidts"
+    )
+
+    assert {cookie.domain for cookie in client.cookies.jar} == {".google.com"}

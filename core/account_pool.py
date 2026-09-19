@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import json
+import random
+import time
+from pathlib import Path
+from threading import Condition, Lock
+from typing import Any
+
+from utils.log import logger
+from core.database import database
+
+
+class BaseAccountPool:
+    """账号池：负责账号占用、等待、释放与失效，不设置调用冷却。
+
+    Subclasses override hooks to customize behavior per provider.
+    """
+
+    MAX_INFLIGHT_TOTAL: int = 4
+    MIN_DISPATCH_INTERVAL_SECONDS: float = 1.0
+    TRANSIENT_COOLDOWN_SECONDS: int = 30
+    RATE_LIMIT_COOLDOWN_SECONDS: int = 300
+    PROVIDER_NAME: str = "base"
+
+    def __init__(self, data_file: Path | None = None, platform: str = "") -> None:
+        self._lock = Lock()
+        self._condition = Condition(self._lock)
+        self._data_file = data_file
+        self._platform = platform
+        self._accounts: dict[str, dict[str, Any]] = self._load()
+
+    # ── Persistence ──
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        if self._platform:
+            rows = database.list_accounts(self._platform)
+            if rows:
+                return {
+                    str(row.get("email") or row.get("name")): {
+                        **row,
+                        "inflight": 0,
+                        "inflight_image": 0,
+                        "inflight_chat": 0,
+                        "last_used_at": 0,
+                        "last_dispatched_at": 0.0,
+                    }
+                    for row in rows
+                }
+        if self._data_file is None:
+            return {}
+        self._data_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._data_file.exists():
+            return {}
+        try:
+            data = json.loads(self._data_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.error(f"Failed to load {self._data_file.name}: {exc}")
+            return {}
+
+    def _save(self) -> None:
+        if self._platform:
+            for key, account in self._accounts.items():
+                credentials = {
+                    k: v for k, v in account.items()
+                    if k not in {
+                        "name", "email", "proxy", "status",
+                        "inflight", "inflight_image", "inflight_chat",
+                        "last_used_at", "last_dispatched_at", "cooldown_until", "failure_count", "error_message"
+                    }
+                }
+                database.import_account(
+                    self._platform, key, credentials,
+                    account.get("proxy", ""), account.get("status", "active"),
+                    int(account.get("cooldown_until", 0)), int(account.get("failure_count", 0)),
+                    account.get("error_message", "")
+                )
+            return
+        if self._data_file is None:
+            return
+        try:
+            self._data_file.write_text(
+                json.dumps(self._accounts, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.error(f"Failed to save {self._data_file.name}: {exc}")
+
+    # ── CRUD ──
+
+    def delete_account(self, key: str) -> bool:
+        with self._lock:
+            if key not in self._accounts:
+                return False
+            del self._accounts[key]
+            if self._platform:
+                database.delete_account(self._platform, key)
+            self._save()
+            return True
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [self._mask_sensitive(dict(acc)) for acc in self._accounts.values()]
+
+    # ── Scheduling ──
+
+    def _reserve_available_account(self, task_type: str) -> dict[str, Any] | None:
+        norm_type = "image" if task_type == "image" else "chat"
+        now = time.time()
+        candidates = []
+        for account in self._accounts.values():
+            if account.get("status") != "active" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+                continue
+            # 临时故障账号在冷却期内不参与普通调度，避免随机再次命中同一故障出口。
+            if account.get("cooldown_until", 0) > now:
+                continue
+            if now - account.get("last_dispatched_at", 0.0) < self.MIN_DISPATCH_INTERVAL_SECONDS:
+                continue
+            candidates.append(account)
+        if not candidates:
+            return None
+        selected = self._select_strategy(candidates)
+        selected[f"inflight_{norm_type}"] = selected.get(f"inflight_{norm_type}", 0) + 1
+        selected["inflight"] = selected.get("inflight_image", 0) + selected.get("inflight_chat", 0)
+        selected["last_used_at"] = int(now)
+        selected["last_dispatched_at"] = now
+        return dict(selected)
+
+    def get_available_account(self, task_type: str = "chat") -> dict[str, Any]:
+        """立即获取账号；管理端探测等非任务调用可据此得到明确的无可用账号错误。"""
+        with self._condition:
+            account = self._reserve_available_account(task_type)
+            if account is None:
+                raise RuntimeError(f"No available {self.PROVIDER_NAME} accounts for task_type '{task_type}'")
+            return account
+
+    def wait_for_available_account(self, task_type: str = "chat") -> dict[str, Any]:
+        """业务请求在账号忙碌时等待释放，不因正常占用而失败。"""
+        with self._condition:
+            while True:
+                account = self._reserve_available_account(task_type)
+                if account is not None:
+                    return account
+                now = time.time()
+                deadlines = []
+                for candidate in self._accounts.values():
+                    if candidate.get("status") != "active" or candidate.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+                        continue
+                    deadline = max(
+                        float(candidate.get("cooldown_until", 0)),
+                        float(candidate.get("last_dispatched_at", 0)) + self.MIN_DISPATCH_INTERVAL_SECONDS,
+                    )
+                    if deadline > now:
+                        deadlines.append(deadline)
+                # 没有可用账号时，既等待释放，也在最早冷却或分配间隔到期时自动重新调度。
+                timeout = max(0.01, min(deadlines) - now) if deadlines else None
+                self._condition.wait(timeout)
+
+    def release_account(
+        self,
+        key: str,
+        success: bool,
+        error: str = "",
+        status_code: int | None = None,
+        retry_after: int | None = None,
+        task_type: str = "chat",
+    ) -> None:
+        """释放账号；失败账号立即停用，成功账号无任何额外冷却。"""
+        norm_type = "image" if task_type == "image" else "chat"
+        with self._condition:
+            account = self._accounts.get(key)
+            if not account:
+                return
+
+            account[f"inflight_{norm_type}"] = max(0, account.get(f"inflight_{norm_type}", 1) - 1)
+            account["inflight"] = account.get("inflight_image", 0) + account.get("inflight_chat", 0)
+            if success:
+                account["status"] = "active"
+                account["cooldown_until"] = 0
+                account["failure_count"] = 0
+                account["error_message"] = ""
+                self._save()
+            elif error:
+                account["error_message"] = error[:500]
+                account["failure_count"] = account.get("failure_count", 0) + 1
+                category = self._classify_error(error, status_code)
+                if category == "fatal":
+                    account["status"] = "error"
+                    account["cooldown_until"] = 0
+                else:
+                    account["status"] = "active"
+                    delay = retry_after if retry_after and retry_after > 0 else (
+                        self.RATE_LIMIT_COOLDOWN_SECONDS if category == "rate_limit" else self.TRANSIENT_COOLDOWN_SECONDS
+                    )
+                    account["cooldown_until"] = int(time.time()) + delay
+                self._save()
+            self._condition.notify_all()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "total_accounts": len(self._accounts),
+                "active_accounts": sum(
+                    1 for a in self._accounts.values() if a.get("status") == "active"
+                ),
+                "cooldown_accounts": 0,
+                "total_inflight_tasks": sum(
+                    a.get("inflight", 0) for a in self._accounts.values()
+                ),
+                "total_inflight_image": sum(
+                    a.get("inflight_image", 0) for a in self._accounts.values()
+                ),
+                "total_inflight_chat": sum(
+                    a.get("inflight_chat", 0) for a in self._accounts.values()
+                ),
+            }
+
+    def capacity(self) -> dict[str, int | None]:
+        """Return the current shared account capacity without reserving a slot."""
+        with self._lock:
+            now = time.time()
+            usable = [
+                account for account in self._accounts.values()
+                if account.get("status") == "active" and account.get("cooldown_until", 0) <= now
+            ]
+            cooldowns = [
+                float(account.get("cooldown_until", 0))
+                for account in self._accounts.values()
+                if float(account.get("cooldown_until", 0)) > now
+            ]
+            return {
+                "available_slots": sum(max(0, self.MAX_INFLIGHT_TOTAL - account.get("inflight", 0)) for account in usable),
+                "total_slots": len(usable) * self.MAX_INFLIGHT_TOTAL,
+                "cooldown_accounts": len(cooldowns),
+                "next_available_at": int(min(cooldowns)) if cooldowns else None,
+            }
+
+    # ── Hooks (override in subclasses) ──
+
+    def _select_strategy(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """每次调用从当前可用账号中随机选择，不与任务绑定。"""
+        return random.choice(candidates)
+
+    def _mask_sensitive(self, account: dict[str, Any]) -> dict[str, Any]:
+        """Mask sensitive fields for list display. Override per provider."""
+        return account
+
+    def _classify_error(self, error: str, status_code: int | None = None) -> str:
+        """Classify an error. Return 'fatal', 'rate_limit', or 'transient'.
+        Override per provider for provider-specific error keywords.
+        """
+        lower = error.lower()
+        if any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401")):
+            return "fatal"
+        if status_code == 429 or any(kw in lower for kw in ("quota", "rate limit", "too many")):
+            return "rate_limit"
+        return "transient"

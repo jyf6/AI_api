@@ -1,5 +1,5 @@
 {
-  "auth-key": "chatgpt2api",
+  "auth-key": "local-kAVAUIEfHSI9ffg1QPQmxYf25s5K",
   "refresh_account_interval_minute": 5,
   "image_retention_days": 15,
   "image_poll_timeout_secs": 120,
@@ -104,5 +104,6 @@
       "url": "https://canvas.best"
     }
   },
-  "image_remove_conversation_after_result": true
+  "image_remove_conversation_after_result": false,
+  "image_remove_conversation_always": false
 }

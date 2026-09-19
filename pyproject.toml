@@ -9,15 +9,24 @@ dependencies = [
     "aiohttp>=3.9",
     "aiohttp-socks>=0.9",
     "fastapi>=0.115.0",
-    "gemini-webapi>=2.1.1",
+    "httpx>=0.28.1",
+    "loguru~=0.7.3",
+    "orjson~=3.11.9",
     "pybase64>=1.4.0",
     "pydantic>=2.0.0",
     "uvicorn>=0.30.0",
+    "websockets>=15.0",
+    "pillow>=10.0.0",
+    "pymysql>=1.1.1",
+    "opencv-python-headless>=5.0.0.93",
+    "numpy>=2.4.6",
+    "python-multipart>=0.0.32",
+    "rembg>=2.0.84",
+    "onnxruntime>=1.29.0",
 ]
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=8.0",
 ]
 

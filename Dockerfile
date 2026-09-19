@@ -1,56 +1,25 @@
-ARG BUILDPLATFORM
-ARG TARGETPLATFORM
-ARG TARGETARCH
-
-FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
-
-WORKDIR /app/web
-
-COPY web/package.json web/bun.lock ./
-RUN npm install
-
-COPY VERSION /app/VERSION
-COPY CHANGELOG.md /app/CHANGELOG.md
-COPY web ./
-RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" npm run build
-
-
-FROM --platform=$TARGETPLATFORM python:3.13-slim AS app
-
-ARG TARGETPLATFORM
-ARG TARGETARCH
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    GEMINI_COOKIE_PATH=/app/data/gemini_webapi \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
-
-# 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    libpq-dev \
-    gcc \
-    openssl \
-    && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
+# Gemini 网页端逆向通过 HTTP 协议工作，不需要下载 Chromium 浏览器运行时。
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
-COPY config.json ./
-COPY VERSION ./
 COPY api ./api
-COPY services ./services
+COPY core ./core
+COPY providers ./providers
 COPY utils ./utils
-COPY scripts ./scripts
-COPY --from=web-build /app/web/out ./web_dist
 
-EXPOSE 80
+EXPOSE 8000
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--access-log"]

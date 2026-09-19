@@ -1,0 +1,208 @@
+#1 [internal] load local bake definitions
+#1 reading from stdin 520B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 646B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/python:3.12-slim
+#3 DONE 10.1s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 158B 0.0s done
+#4 DONE 0.1s
+
+#5 [ 1/10] FROM docker.io/library/python:3.12-slim@sha256:23b5dc88c7dd47fec3f960b51dc30d19df9875cfbfc60f3b62d3e5b88cbccf62
+#5 resolve docker.io/library/python:3.12-slim@sha256:23b5dc88c7dd47fec3f960b51dc30d19df9875cfbfc60f3b62d3e5b88cbccf62 0.0s done
+#5 sha256:06ad939ed42b51caafb25b14810875d14e0ee0c441d3e2e5e46475fb8c150bca 249B / 249B 8.7s done
+#5 sha256:3764a9a7d1e8a98213ab2201a41dbf3da9c60240ea35a5ea96ab994555070a70 1.29MB / 1.29MB 25.1s done
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 6.29MB / 29.83MB 50.1s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 5.24MB / 12.12MB 50.1s
+#5 ...
+
+#6 [internal] load build context
+#6 transferring context: 1.69MB 0.2s done
+#6 DONE 0.2s
+
+#5 [ 1/10] FROM docker.io/library/python:3.12-slim@sha256:23b5dc88c7dd47fec3f960b51dc30d19df9875cfbfc60f3b62d3e5b88cbccf62
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 6.29MB / 12.12MB 54.0s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 7.34MB / 29.83MB 55.2s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 6.29MB / 12.12MB 59.1s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 7.34MB / 12.12MB 59.8s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 7.34MB / 29.83MB 60.3s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 8.39MB / 12.12MB 63.4s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 9.44MB / 12.12MB 64.5s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 10.49MB / 12.12MB 64.9s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 11.53MB / 12.12MB 65.4s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 7.34MB / 29.83MB 65.4s
+#5 sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 12.12MB / 12.12MB 65.8s done
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 8.39MB / 29.83MB 70.5s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 10.49MB / 29.83MB 75.1s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 12.58MB / 29.83MB 76.3s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 14.68MB / 29.83MB 77.1s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 16.78MB / 29.83MB 77.5s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 18.87MB / 29.83MB 78.0s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 20.97MB / 29.83MB 78.6s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 23.07MB / 29.83MB 79.0s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 25.17MB / 29.83MB 79.5s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 27.26MB / 29.83MB 80.1s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 29.36MB / 29.83MB 80.5s
+#5 sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 29.83MB / 29.83MB 80.6s done
+#5 extracting sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8
+#5 extracting sha256:6b37362b3da78869050b894b799ad4df04f1f3b52774087db0d81151570244c8 0.6s done
+#5 DONE 81.5s
+
+#5 [ 1/10] FROM docker.io/library/python:3.12-slim@sha256:23b5dc88c7dd47fec3f960b51dc30d19df9875cfbfc60f3b62d3e5b88cbccf62
+#5 extracting sha256:3764a9a7d1e8a98213ab2201a41dbf3da9c60240ea35a5ea96ab994555070a70 0.1s done
+#5 extracting sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0
+#5 extracting sha256:b0dc7f87bef15c2536cb182d6c48b52f90a0522884ec9eb222f833fa97ffebf0 0.3s done
+#5 DONE 81.9s
+
+#5 [ 1/10] FROM docker.io/library/python:3.12-slim@sha256:23b5dc88c7dd47fec3f960b51dc30d19df9875cfbfc60f3b62d3e5b88cbccf62
+#5 extracting sha256:06ad939ed42b51caafb25b14810875d14e0ee0c441d3e2e5e46475fb8c150bca 0.0s done
+#5 DONE 81.9s
+
+#7 [ 2/10] WORKDIR /app
+#7 DONE 0.2s
+
+#8 [ 3/10] RUN pip install --no-cache-dir uv
+#8 3.251 Collecting uv
+#8 3.994   Downloading uv-0.12.17-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (11 kB)
+#8 4.314 Downloading uv-0.12.17-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (20.4 MB)
+#8 11.85    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 20.4/20.4 MB 3.0 MB/s eta 0:00:00
+#8 11.87 Installing collected packages: uv
+#8 12.09 Successfully installed uv-0.12.17
+#8 12.09 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+#8 13.16 
+#8 13.16 [notice] A new release of pip is available: 25.0.1 -> 26.2.1
+#8 13.16 [notice] To update, run: pip install --upgrade pip
+#8 DONE 13.3s
+
+#9 [ 4/10] COPY pyproject.toml uv.lock ./
+#9 DONE 0.2s
+
+#10 [ 5/10] RUN uv sync --frozen --no-dev --no-install-project
+#10 0.450 Using CPython 3.12.14 interpreter at: /usr/local/bin/python3
+#10 0.450 Creating virtual environment at: .venv
+#10 2.295 Downloading scikit-image (12.9MiB)
+#10 2.536 Downloading aiohttp (1.7MiB)
+#10 2.834 Downloading opencv-python-headless (58.4MiB)
+#10 2.882 Downloading numpy (15.9MiB)
+#10 2.883 Downloading pillow (6.6MiB)
+#10 2.884 Downloading scipy (33.7MiB)
+#10 2.887 Downloading pydantic-core (2.0MiB)
+#10 3.157 Downloading onnxruntime (22.1MiB)
+#10 3.157 Downloading curl-cffi (12.9MiB)
+#10 3.797 Downloading numba (3.7MiB)
+#10 4.088 Downloading networkx (2.0MiB)
+#10 4.089 Downloading llvmlite (57.1MiB)
+#10 4.656  Downloaded aiohttp
+#10 11.07  Downloaded networkx
+#10 14.81  Downloaded scikit-image
+#10 23.22  Downloaded onnxruntime
+#10 27.05  Downloaded curl-cffi
+#10 29.99  Downloaded pillow
+#10 30.67  Downloaded numpy
+#10 31.02  Downloaded pydantic-core
+#10 38.24  Downloaded numba
+#10 47.28  Downloaded opencv-python-headless
+#10 50.79  Downloaded scipy
+#10 68.52  Downloaded llvmlite
+#10 68.52 Prepared 62 packages in 1m 08s
+#10 69.02 Installed 62 packages in 499ms
+#10 69.02  + aiohappyeyeballs==2.7.1
+#10 69.02  + aiohttp==3.14.3
+#10 69.02  + aiohttp-socks==0.12.0
+#10 69.02  + aiosignal==1.4.0
+#10 69.02  + annotated-doc==0.0.4
+#10 69.02  + annotated-types==0.7.0
+#10 69.02  + anyio==4.13.0
+#10 69.02  + attrs==26.1.0
+#10 69.02  + certifi==2026.2.25
+#10 69.02  + cffi==2.0.0
+#10 69.02  + charset-normalizer==3.5.1
+#10 69.02  + click==8.3.2
+#10 69.02  + curl-cffi==0.16.2
+#10 69.02  + fastapi==0.136.0
+#10 69.02  + flatbuffers==25.12.19
+#10 69.02  + frozenlist==1.8.0
+#10 69.02  + h11==0.16.0
+#10 69.02  + httpcore==1.0.9
+#10 69.02  + httpx==0.28.1
+#10 69.02  + idna==3.11
+#10 69.02  + imageio==2.37.4
+#10 69.02  + jsonschema==4.26.0
+#10 69.02  + jsonschema-specifications==2025.9.1
+#10 69.02  + lazy-loader==0.5
+#10 69.02  + llvmlite==0.49.0
+#10 69.02  + loguru==0.7.3
+#10 69.02  + multidict==6.7.1
+#10 69.02  + networkx==3.6.1
+#10 69.02  + numba==0.67.0
+#10 69.02  + numpy==2.5.3
+#10 69.02  + onnxruntime==1.29.0
+#10 69.02  + opencv-python-headless==5.0.0.93
+#10 69.02  + orjson==3.11.9
+#10 69.02  + packaging==26.3
+#10 69.02  + pillow==12.3.0
+#10 69.02  + platformdirs==4.11.8
+#10 69.02  + pooch==1.9.0
+#10 69.02  + propcache==0.5.2
+#10 69.02  + protobuf==7.36.1
+#10 69.02  + pybase64==1.4.3
+#10 69.02  + pycparser==3.0
+#10 69.02  + pydantic==2.12.5
+#10 69.02  + pydantic-core==2.41.5
+#10 69.02  + pymatting==1.1.16
+#10 69.02  + pymysql==1.2.0
+#10 69.02  + python-multipart==0.0.32
+#10 69.02  + python-socks==3.0.0
+#10 69.02  + referencing==0.37.0
+#10 69.02  + rembg==2.0.84
+#10 69.02  + requests==2.34.2
+#10 69.02  + rpds-py==2026.6.3
+#10 69.02  + scikit-image==0.26.0
+#10 69.02  + scipy==1.18.1
+#10 69.02  + starlette==1.0.0
+#10 69.02  + tifffile==2026.9.9
+#10 69.02  + tqdm==4.70.0
+#10 69.02  + typing-extensions==4.15.0
+#10 69.02  + typing-inspection==0.4.2
+#10 69.02  + urllib3==2.7.0
+#10 69.02  + uvicorn==0.44.0
+#10 69.02  + websockets==17.1
+#10 69.02  + yarl==1.24.5
+#10 DONE 69.7s
+
+#11 [ 6/10] COPY main.py ./
+#11 DONE 0.2s
+
+#12 [ 7/10] COPY api ./api
+#12 DONE 0.1s
+
+#13 [ 8/10] COPY core ./core
+#13 DONE 0.1s
+
+#14 [ 9/10] COPY providers ./providers
+#14 DONE 0.2s
+
+#15 [10/10] COPY utils ./utils
+#15 DONE 0.1s
+
+#16 exporting to image
+#16 exporting layers
+#16 exporting layers 34.7s done
+#16 exporting manifest sha256:c0aa4ee1ad706747a139ff0888c7fb520f314a984d45ee2e7a0229c543fb2f22 0.0s done
+#16 exporting config sha256:8b46a2e4a5744173fa6a56865b7dc370f4f4caa8361992b2f410c14d36e4128b 0.0s done
+#16 exporting attestation manifest sha256:b3b479cb815264301d895cab9f6e540aeab60c899839d4db108d8ba3c2f2c715
+#16 exporting attestation manifest sha256:b3b479cb815264301d895cab9f6e540aeab60c899839d4db108d8ba3c2f2c715 0.1s done
+#16 exporting manifest list sha256:62d523724fe2d938343c3e89cadf239d6bf9297c040dde2b02c67c4fbd28492b
+#16 exporting manifest list sha256:62d523724fe2d938343c3e89cadf239d6bf9297c040dde2b02c67c4fbd28492b 0.1s done
+#16 naming to docker.io/library/chatgpt-image-service:latest 0.0s done
+#16 unpacking to docker.io/library/chatgpt-image-service:latest
+#16 unpacking to docker.io/library/chatgpt-image-service:latest 12.5s done
+#16 DONE 47.6s
+
+#17 resolving provenance for metadata file
+#17 DONE 0.2s

@@ -91,7 +91,7 @@ docker run -d -p 8000:8000 -v $(pwd)/data:/app/data --name img-service chatgpt-i
 - 生图：`POST /v1/images/generations`，模型如 `gemini-2.5-pro-image`。
 - 失败时本次请求直接返回失败并降低所用 Gemini 账号状态，不自动切换其他账号。
 
-Gemini 通过 `gemini-webapi` 的网页内部 HTTP 协议调用，不依赖 Playwright 或 Chromium。该依赖为 GPL-3.0；使用或分发本服务前请审查其许可证条款。
+Gemini 通过项目内置的网页内部 HTTP 协议实现调用，不依赖 Playwright 或 Chromium。该实现保留了原始 GPL-3.0 许可证；使用或分发本服务前请审查其许可证条款。
 
 **响应示例**：
 ```json
