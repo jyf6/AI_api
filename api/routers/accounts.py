@@ -196,6 +196,8 @@ async def test_gemini_account(name: str):
             result = await backend.client.generate_content("请只回复 OK。", temporary=True)
             if not result.text.strip():
                 raise RuntimeError("Gemini 测试请求未返回文本")
+            if "ok" not in result.text.lower():
+                raise RuntimeError("Gemini 测试请求未返回预期内容 OK")
         gemini_account_service.release_account(name, success=True)
         return {"code": 0, "message": "Account is healthy", "elapsed": f"{time.time() - t0:.2f}s"}
     except Exception as exc:
