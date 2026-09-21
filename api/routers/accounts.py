@@ -190,9 +190,12 @@ async def test_gemini_account(name: str):
         raise HTTPException(status_code=404, detail="Account not found")
     t0 = time.time()
     try:
-        model = resolve_model("gemini-chat", "chat").model
         async with GeminiBackendAPI(account) as backend:
-            await backend.chat("Hi", model=model)
+            if not backend.client._check_account_status():
+                raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
+            result = await backend.client.generate_content("请只回复 OK。", temporary=True)
+            if not result.text.strip():
+                raise RuntimeError("Gemini 测试请求未返回文本")
         gemini_account_service.release_account(name, success=True)
         return {"code": 0, "message": "Account is healthy", "elapsed": f"{time.time() - t0:.2f}s"}
     except Exception as exc:

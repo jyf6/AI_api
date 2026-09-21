@@ -3,6 +3,8 @@ import sys
 import time
 import types
 
+from fastapi import HTTPException
+
 from providers.gemini.account import GeminiAccountPool
 from providers.gemini.backend import GeminiBackendAPI
 from api.routers import accounts
@@ -210,3 +212,87 @@ def test_new_gemini_account_starts_its_refresh_client(monkeypatch):
 
     assert response["status"] == "active"
     assert pool.started == "main"
+
+
+def test_gemini_account_test_rejects_an_unauthenticated_client(monkeypatch):
+    """The management health check must not treat guest text as account health."""
+    class FakePool:
+        def __init__(self):
+            self._lock = __import__("threading").Lock()
+            self._accounts = {"main": {"name": "main"}}
+            self.released = None
+
+        def release_account(self, *args, **kwargs):
+            self.released = (args, kwargs)
+
+    class FakeBackend:
+        def __init__(self, _account):
+            self.client = types.SimpleNamespace(
+                _check_account_status=lambda: False,
+                generate_content=lambda *_args, **_kwargs: None,
+            )
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    pool = FakePool()
+    monkeypatch.setattr(accounts, "gemini_account_service", pool)
+    monkeypatch.setattr(accounts, "GeminiBackendAPI", FakeBackend)
+
+    try:
+        asyncio.run(accounts.test_gemini_account("main"))
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert "未认证" in exc.detail
+    else:
+        assert False, "an unauthenticated Gemini client must fail the health check"
+
+    assert pool.released[1]["success"] is False
+
+
+def test_gemini_account_test_requires_a_temporary_real_response(monkeypatch):
+    class FakePool:
+        def __init__(self):
+            self._lock = __import__("threading").Lock()
+            self._accounts = {"main": {"name": "main"}}
+            self.released = None
+
+        def release_account(self, *args, **kwargs):
+            self.released = (args, kwargs)
+
+    class FakeClient:
+        def __init__(self):
+            self.request = None
+
+        def _check_account_status(self):
+            return True
+
+        async def generate_content(self, prompt, *, temporary):
+            self.request = (prompt, temporary)
+            return types.SimpleNamespace(text="OK")
+
+    class FakeBackend:
+        instance = None
+
+        def __init__(self, _account):
+            self.client = FakeClient()
+            type(self).instance = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+    pool = FakePool()
+    monkeypatch.setattr(accounts, "gemini_account_service", pool)
+    monkeypatch.setattr(accounts, "GeminiBackendAPI", FakeBackend)
+
+    response = asyncio.run(accounts.test_gemini_account("main"))
+
+    assert response["code"] == 0
+    assert FakeBackend.instance.client.request == ("请只回复 OK。", True)
+    assert pool.released[1]["success"] is True

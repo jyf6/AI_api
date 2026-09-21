@@ -251,7 +251,7 @@ class BaseAccountPool:
         Override per provider for provider-specific error keywords.
         """
         lower = error.lower()
-        if any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401")):
+        if any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401", "未认证")):
             return "fatal"
         if status_code == 429 or any(kw in lower for kw in ("quota", "rate limit", "too many")):
             return "rate_limit"
