@@ -44,9 +44,3 @@ class GeminiAccountRequest(BaseModel):
     proxy: str = ""
 
 
-class ModelConfigUpdateRequest(BaseModel):
-    image_model: str = Field(..., description="生图调用的底层大模型名称")
-    chat_model: str = Field(..., description="多模态分析调用的底层大模型名称")
-    description: str = Field(default="", description="描述信息")
-
-

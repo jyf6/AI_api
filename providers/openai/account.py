@@ -89,15 +89,21 @@ class OpenAIAccountPool(BaseAccountPool):
                 account["plan_type"] = plan_type
                 account["access_token_expires_at"] = expires_at
                 account["status"] = "active"
+                account["cooldown_until"] = 0
+                account["failure_count"] = 0
                 account["error_message"] = ""
                 self._save()
                 self._condition.notify_all()
             return account
         except Exception as exc:
-            with self._lock:
-                account["status"] = "error"
+            category = self._classify_error(str(exc), getattr(exc, "status_code", None))
+            with self._condition:
+                if category == "fatal":
+                    account["status"] = "error"
+                    account["cooldown_until"] = 0
                 account["error_message"] = str(exc)
                 self._save()
+                self._condition.notify_all()
             raise
 
     # ── Override get_available_account for auto-refresh ──
@@ -143,10 +149,13 @@ class OpenAIAccountPool(BaseAccountPool):
 
     def _classify_error(self, error: str, status_code: int | None = None) -> str:
         lower = error.lower()
-        if any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated")):
+        if status_code == 401 or any(kw in lower for kw in (
+            "invalid_grant", "invalid refresh token", "invalid token", "token expired",
+            "unauthorized", "deactivated", "account disabled",
+        )):
             return "fatal"
         if status_code == 429 or any(kw in lower for kw in (
-            "quota", "rate limit", "too many", "image_quota_exhausted", "图像生成请求上限", "图片生成请求上限",
+            "quota", "rate limit", "too many", "429", "image_quota_exhausted", "图像生成请求上限", "图片生成请求上限",
         )):
             return "rate_limit"
         return "transient"

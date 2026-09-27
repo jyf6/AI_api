@@ -141,6 +141,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         "language",
         "last_activity_time",
         "on_cookie_refreshed",
+        "persist_cookie_cache",
         "proxy",
         "push_id",
         "refresh_interval",
@@ -184,6 +185,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         self.on_cookie_refreshed: Callable[["GeminiClient"], Any] | None = kwargs.pop(
             "on_cookie_refreshed", None
         )
+        # 请求专用客户端不能把旧 Cookie 写回账号级缓存；续期缓存只由常驻客户端维护。
+        self.persist_cookie_cache: bool = kwargs.pop("persist_cookie_cache", True)
         self._running: bool = False
         self._cookies = Cookies()
         self._cookie_source: str = ""
@@ -395,7 +398,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         # Only save cookies if the client was running and successfully initialized.
         # When init() fails (e.g. network/DNS error), self._cookies only contains uninitialized
         # or initial base cookies, which must never overwrite existing valid cache files.
-        if not was_running:
+        if not was_running or not self.persist_cookie_cache:
             return
 
         # Cached cookies are tried ahead of the ones the caller supplies, so caching an

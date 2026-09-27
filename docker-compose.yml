@@ -14,6 +14,7 @@ services:
       - ./config.json:/app/config.json
     environment:
       GEMINI_COOKIE_PATH: /app/data/gemini_webapi
+      GEMINI_REFRESH_INTERVAL: ${GEMINI_REFRESH_INTERVAL:-600}
       STORAGE_BACKEND: mysql
       MYSQL_HOST: host.docker.internal
       MYSQL_PORT: 3306

@@ -2,16 +2,13 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import accounts, capacity, chat, edit, health, images, oauth, operations
+from api.routers import accounts, capacity, chat, edit, health, images, oauth
 
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         import asyncio
-        from core.database import database
         from providers.gemini.account import gemini_account_service
-        # 重启不能把正在执行的非幂等请求当作可安全重试请求。
-        database.recover_running_operations()
         # 服务启动即并发预热活跃账号，由项目内 Gemini Web API 接管后台保活与 Cookie 续期。
         warmup_task = asyncio.create_task(gemini_account_service.warmup_clients())
         yield
@@ -35,7 +32,6 @@ def create_app() -> FastAPI:
     app.include_router(images.router)
     app.include_router(capacity.router)
     app.include_router(chat.router)
-    app.include_router(operations.router)
     app.include_router(accounts.router)
     app.include_router(oauth.router)
     app.include_router(health.router)

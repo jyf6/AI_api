@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import urllib.request
 
+import hashlib
 import json
 import uuid
 
@@ -11,9 +12,6 @@ from utils.image_binary import image_media_type
 
 class DoubaoBackendAPI:
     BASE_URL = "https://www.doubao.com"
-    DEFAULT_DEVICE_ID = "714003710229497"
-    DEFAULT_WEB_ID = "7604137868021548590"
-    DEFAULT_FP = "verify_mlcfw5f7_TPq0YmFD_NrsC_4RuQ_BJPg_M5W7i58I7wV0"
     DEFAULT_CHROMIUM_VERSION = "135.0.0.0"
 
     def __init__(self, cookies: dict[str, str], proxy: str = "") -> None:
@@ -22,6 +20,36 @@ class DoubaoBackendAPI:
         self.cookies = cookies
         self.proxy = proxy or None
         self.session: aiohttp.ClientSession | None = None
+        # 账号专有设备指纹初始化（消除全局硬编码，实现多账号设备隔离）
+        self.device_id = self._init_device_id()
+        self.web_id = self._init_web_id()
+        self.fp = self._init_fp()
+
+    def _init_device_id(self) -> str:
+        """优先使用 Cookie 中的 device_id；若缺失，则基于账号 sessionid/uid 生成专属唯一的 19 位设备 ID，隔离多账号风控。"""
+        if self.cookies.get("device_id"):
+            return str(self.cookies["device_id"])
+        seed = self.cookies.get("sessionid") or self.cookies.get("uid_tt") or self.cookies.get("sid_tt") or "default_device"
+        num = int(hashlib.md5(f"doubao_dev_{seed}".encode()).hexdigest()[:15], 16)
+        return str(7000000000000000000 + (num % 900000000000000000))
+
+    def _init_web_id(self) -> str:
+        """优先使用 Cookie 中的 web_id；若缺失，则基于账号唯一特征生成专属唯一的 19 位 Web 实例 ID。"""
+        if self.cookies.get("web_id"):
+            return str(self.cookies["web_id"])
+        seed = self.cookies.get("sessionid") or self.cookies.get("uid_tt") or self.cookies.get("sid_tt") or "default_web"
+        num = int(hashlib.md5(f"doubao_web_{seed}".encode()).hexdigest()[:15], 16)
+        return str(7600000000000000000 + (num % 90000000000000000))
+
+    def _init_fp(self) -> str:
+        """优先使用 Cookie 中的 fp 或 s_v_web_id；若缺失，则基于账号 Session 生成合规的专属指纹格式。"""
+        if self.cookies.get("fp"):
+            return str(self.cookies["fp"])
+        if self.cookies.get("s_v_web_id"):
+            return str(self.cookies["s_v_web_id"])
+        seed = self.cookies.get("sessionid") or "default_fp"
+        h = hashlib.md5(f"doubao_fp_{seed}".encode()).hexdigest()
+        return f"verify_m{h[:7]}_{h[7:15]}_{h[15:19]}_4RuQ_BJPg_M5W7i58I7wV0"
 
     async def __aenter__(self):
         connector = self._build_connector()
@@ -34,6 +62,10 @@ class DoubaoBackendAPI:
         """账号配置了代理时返回代理连接器，保证所有出站请求走同一代理出口。"""
         if self.proxy:
             from aiohttp_socks import ProxyConnector
+            if self.proxy.lower().startswith("socks5h://"):
+                # aiohttp-socks uses socks5:// plus rdns=True for remote DNS.
+                proxy_url = "socks5://" + self.proxy[len("socks5h://"):]
+                return ProxyConnector.from_url(proxy_url, rdns=True)
             return ProxyConnector.from_url(self.proxy)
         return None
 
@@ -43,18 +75,54 @@ class DoubaoBackendAPI:
         self.session = None
 
     def _params(self) -> dict[str, str]:
-        return {"aid": "582478", "real_aid": "582478", "device_id": self.cookies.get("device_id", self.DEFAULT_DEVICE_ID),
-                "tea_uuid": self.cookies.get("device_id", self.DEFAULT_DEVICE_ID), "web_id": self.cookies.get("web_id", self.DEFAULT_WEB_ID),
-                "device_platform": "web", "language": "zh", "region": "CN", "sys_region": "CN",
-                "pkg_type": "release_version", "version_code": "20800", "pc_version": "2.1.7",
-                "chromium_version": self.DEFAULT_CHROMIUM_VERSION, "client_platform": "pc_client", "runtime": "web",
-                "runtime_version": "3.5.4", "samantha_web": "1", "use-olympus-account": "1",
-                "fp": self.cookies.get("fp", self.cookies.get("s_v_web_id", self.DEFAULT_FP)), "msToken": self.cookies.get("msToken", ""), "web_tab_id": str(uuid.uuid4())}
+        return {
+            "aid": "582478",
+            "real_aid": "582478",
+            "device_id": self.device_id,
+            "tea_uuid": self.device_id,
+            "web_id": self.web_id,
+            "device_platform": "web",
+            "language": "zh",
+            "region": "CN",
+            "sys_region": "CN",
+            "pkg_type": "release_version",
+            "version_code": "20800",
+            "pc_version": "2.1.7",
+            "chromium_version": self.DEFAULT_CHROMIUM_VERSION,
+            "client_platform": "pc_client",
+            "runtime": "web",
+            "runtime_version": "3.5.4",
+            "samantha_web": "1",
+            "use-olympus-account": "1",
+            "fp": self.fp,
+            "msToken": self.cookies.get("msToken", ""),
+            "web_tab_id": str(uuid.uuid4()),
+        }
 
     async def upload_image(self, image_data: str, filename: str = "image.png") -> dict[str, str]:
         if not self.session:
             raise RuntimeError("Doubao client is not initialized")
         image_bytes = urllib.request.urlopen(image_data, timeout=30).read()
+        # 针对超大图片（体积 > 4MB 或长边 > 2048px）进行内存高质量缩放压缩，彻底避免豆包网关抛出 502 Bad Gateway
+        if len(image_bytes) > 4 * 1024 * 1024:
+            try:
+                import io
+                from PIL import Image
+                img = Image.open(io.BytesIO(image_bytes))
+                max_dim = max(img.width, img.height)
+                if max_dim > 2048:
+                    scale = 2048.0 / max_dim
+                    new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.save(buf, format="JPEG", quality=85, optimize=True)
+                image_bytes = buf.getvalue()
+            except Exception:
+                # 压缩异常时静默回退使用原图
+                pass
+
         content_type = image_media_type(image_bytes)
         if content_type is None:
             raise RuntimeError("Doubao reference download did not return a valid image")

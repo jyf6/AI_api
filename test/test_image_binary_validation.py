@@ -8,14 +8,6 @@ from api.routers import images
 from providers.gemini.backend import _create_temp_image_files
 
 
-class FakeDatabase:
-    def complete_operation(self, *_args, **_kwargs):
-        raise AssertionError("non-image data must never be persisted")
-
-    def fail_operation(self, *_args, **_kwargs):
-        pass
-
-
 class FakeGeminiBackend:
     def __init__(self, _account):
         pass
@@ -32,8 +24,6 @@ class FakeGeminiBackend:
 
 def test_generation_rejects_non_image_response(monkeypatch):
     monkeypatch.setattr(images, "resolve_model", lambda *_args: SimpleNamespace(platform="gemini", model="gemini-pro"))
-    monkeypatch.setattr(images, "begin_operation", lambda *_args: ("operation-1", None))
-    monkeypatch.setattr(images, "database", FakeDatabase())
     monkeypatch.setattr(images.gemini_account_service, "wait_for_available_account", lambda *_args: {"name": "test"})
     monkeypatch.setattr(images.gemini_account_service, "release_account", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(images, "GeminiBackendAPI", FakeGeminiBackend)

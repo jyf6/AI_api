@@ -299,7 +299,7 @@ class OpenAIBackendAPI:
             converted.append(message)
         return converted
 
-    def stream_chat(self, messages: list[dict[str, Any]], model: str = "gpt-5-5") -> Iterator[str]:
+    def stream_chat(self, messages: list[dict[str, Any]], model: str = "auto") -> Iterator[str]:
         self._bootstrap()
         reqs = self._get_chat_requirements()
         path = "/backend-api/conversation"
@@ -319,7 +319,7 @@ class OpenAIBackendAPI:
         finally:
             response.close()
 
-    def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "gpt-5-5") -> str:
+    def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:
         text = ""
         messages = [{"role": "user", "content": ([{"type": "text", "text": prompt}] +
                     [{"type": "image_url", "image_url": {"url": url}} for url in (images or [])])}]
@@ -344,7 +344,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("Upstream chat returned no assistant text")
         return text
 
-    def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "gpt-5-5") -> str:
+    def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "auto") -> str:
         """Prepare image conversation and obtain conduit_token."""
         path = "/backend-api/f/conversation/prepare"
         payload = {
@@ -375,7 +375,7 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
 
-    def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str, model: str = "gpt-5-5", references: list[str] | None = None) -> tuple[requests.Response, set[bytes], set[str]]:
+    def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str, model: str = "auto", references: list[str] | None = None) -> tuple[requests.Response, set[bytes], set[str]]:
         """Initiate image generation SSE long connection."""
         path = "/backend-api/f/conversation"
         parts: list[Any] = []
@@ -705,7 +705,7 @@ class OpenAIBackendAPI:
 
         threading.Thread(target=_delete, daemon=True).start()
 
-    def generate_image_bytes(self, prompt: str, model: str = "gpt-image-2", references: list[str] | None = None, expected_count: int = 1) -> bytes | list[bytes]:
+    def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None, expected_count: int = 1) -> bytes | list[bytes]:
         """Main entry: zero-storage in-memory image generation."""
         if not self.access_token:
             raise ValueError("access_token is required for image generation")

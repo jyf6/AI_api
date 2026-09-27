@@ -150,17 +150,19 @@ class GeminiBackendAPI:
     def __init__(self, account: dict[str, Any]) -> None:
         self.account = account
         self.client = None
+        self._request_generation = 0
 
     async def __aenter__(self):
         from providers.gemini.account import gemini_account_service
-        self.client = await gemini_account_service.get_client(self.account)
+        self.client, self._request_generation = await gemini_account_service.get_request_client(self.account)
         return self
 
-    async def __aexit__(self, *_args):
+    async def __aexit__(self, exc_type, *_args):
         if self.client:
             from providers.gemini.account import gemini_account_service
-            gemini_account_service.merge_cookie(self.account["name"], dict(self.client.cookies))
-            # The client is account-scoped; its auto-refresh task must survive this request.
+            await gemini_account_service.release_request_client(
+                self.account["name"], self.client, self._request_generation, exc_type is None,
+            )
         self.client = None
 
     async def _reconnect(self) -> None:
@@ -169,13 +171,17 @@ class GeminiBackendAPI:
         logger.warning(
             f"[Gemini Self-Healing] 账号 [{self.account.get('name')}] 遇到疑似认证失效，触发重连自愈..."
         )
+        await gemini_account_service.release_request_client(
+            self.account["name"], self.client, self._request_generation, False,
+        )
         await gemini_account_service.discard_client(self.account["name"])
-        self.client = await gemini_account_service.get_client(self.account)
+        self.client, self._request_generation = await gemini_account_service.get_request_client(self.account)
 
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
+        client_model = None if model == "auto" else model
         with _create_temp_image_files(image_sources) as temp_files:
-            stream = self.client.generate_content_stream(prompt, files=temp_files or None, model=model)
+            stream = self.client.generate_content_stream(prompt, files=temp_files or None, model=client_model)
             text = ""
             try:
                 while True:
@@ -203,7 +209,7 @@ class GeminiBackendAPI:
                 # 文本结果可用后不再等待网页端的最终完成标记，主动结束本次流。
                 await stream.aclose()
 
-    async def chat(self, prompt: str, images: list[str] | None = None, model: str = "gemini-1.5-pro") -> str:
+    async def chat(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:
         try:
             return await self._do_chat(prompt, images, model)
         except Exception as exc:
@@ -221,10 +227,11 @@ class GeminiBackendAPI:
         aspect_ratio: str | None = None,
     ) -> list[bytes]:
         _configure_image_aspect_ratio(self.client, aspect_ratio)
+        client_model = None if model == "auto" else model
         try:
             with _create_temp_image_files(references or []) as temp_files:
                 stream = self.client.generate_content_stream(
-                    prompt, files=temp_files or None, model=model
+                    prompt, files=temp_files or None, model=client_model
                 )
                 try:
                     async for output in stream:
@@ -266,43 +273,61 @@ class GeminiBackendAPI:
 
 
 async def _download_generated_image(image: Any, client: Any, proxy: str | None) -> bytes:
-    """Download into memory; follows multi-hop redirects and ensures valid binary image."""
-    url = getattr(image, "url", "")
+    """下载生成的图片二进制；支持 RPC 高清直链优先，并在遭遇 403 等异常时自动平滑降级至 Google CDN。"""
+    headers = {
+        "Origin": "https://gemini.google.com",
+        "Referer": "https://gemini.google.com/",
+    }
+
+    # 1. 优先尝试获取 RPC 高清全尺寸下载直链
+    rpc_url = ""
     if all(getattr(image, key, "") for key in ("cid", "rid", "rcid", "image_id")):
         try:
             full_size_url = await client._get_full_size_image(
                 cid=image.cid, rid=image.rid, rcid=image.rcid, image_id=image.image_id
             )
             if full_size_url:
-                url = full_size_url + "=d-I?alr=yes"
+                rpc_url = full_size_url + "=d-I?alr=yes"
         except Exception as exc:
             logger.debug(f"Failed to get full size URL via RPC: {exc}")
 
-    if not url:
-        raise RuntimeError("Gemini returned an image without a download URL")
+    # 2. 准备官方 CDN 降级兜底直链（替换/增加 =s2048-rj 获得高清画质，永不 403）
+    cdn_url = getattr(image, "url", "")
+    if "=s1024-rj" in cdn_url:
+        cdn_url = cdn_url.replace("=s1024-rj", "=s2048-rj")
+    elif cdn_url and "=s2048-rj" not in cdn_url:
+        cdn_url += "=s2048-rj"
 
     async with AsyncSession(impersonate="chrome145", cookies=client.cookies, proxy=proxy) as session:
-        current_url = url
-        for _ in range(5):
-            response = await session.get(current_url, headers={"Referer": "https://gemini.google.com/"})
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").lower()
+        # 3. 优先走 RPC 链接下载
+        if rpc_url:
+            try:
+                current_url = rpc_url
+                for _ in range(5):
+                    response = await session.get(current_url, headers=headers)
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
 
-            if content_type.startswith("text/") or content_type.startswith("application/json"):
-                next_url = response.text.strip()
-                if next_url.startswith("http://") or next_url.startswith("https://"):
-                    current_url = next_url
-                    continue
-                break
+                    if content_type.startswith("text/") or content_type.startswith("application/json"):
+                        next_url = response.text.strip()
+                        if next_url.startswith("http://") or next_url.startswith("https://"):
+                            current_url = next_url
+                            continue
+                        break
 
-            if image_media_type(response.content) is not None:
-                return response.content
+                    if image_media_type(response.content) is not None:
+                        return response.content
+            except Exception as exc:
+                logger.warning(f"RPC full size image download failed ({exc}), falling back to Google CDN URL.")
 
-        fallback_url = getattr(image, "url", "")
-        if fallback_url and fallback_url != current_url:
-            response = await session.get(fallback_url, headers={"Referer": "https://gemini.google.com/"})
-            response.raise_for_status()
-            if image_media_type(response.content) is not None:
-                return response.content
+        # 4. 降级方案：走 Google CDN URL 下载
+        if cdn_url:
+            try:
+                response = await session.get(cdn_url, headers=headers)
+                response.raise_for_status()
+                if image_media_type(response.content) is not None:
+                    return response.content
+            except Exception as exc:
+                logger.warning(f"Google CDN image download failed: {exc}")
 
-        raise RuntimeError("Gemini image download did not return a valid image")
+    raise RuntimeError("Gemini image download did not return a valid image")

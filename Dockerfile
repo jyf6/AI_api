@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     GEMINI_COOKIE_PATH=/app/data/gemini_webapi \
+    GEMINI_REFRESH_INTERVAL=600 \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app

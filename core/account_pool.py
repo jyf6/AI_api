@@ -29,6 +29,8 @@ class BaseAccountPool:
         self._data_file = data_file
         self._platform = platform
         self._accounts: dict[str, dict[str, Any]] = self._load()
+        # 同一账号当前并发批次的结果只放内存；账号健康状态在批次收敛时持久化。
+        self._batches: dict[str, dict[str, Any]] = {}
 
     # ── Persistence ──
 
@@ -94,23 +96,60 @@ class BaseAccountPool:
             if key not in self._accounts:
                 return False
             del self._accounts[key]
+            self._batches.pop(key, None)
             if self._platform:
                 database.delete_account(self._platform, key)
             self._save()
             return True
 
+    def set_account_health(self, key: str, healthy: bool, error: str = "") -> None:
+        """Update verified account health without changing task in-flight counters."""
+        with self._condition:
+            account = self._accounts.get(key)
+            if not account:
+                return
+            if healthy:
+                account["status"] = "active"
+                account["cooldown_until"] = 0
+                account["failure_count"] = 0
+                account["error_message"] = ""
+                self._batches.pop(key, None)
+            else:
+                account["status"] = "error"
+                account["cooldown_until"] = 0
+                account["failure_count"] = account.get("failure_count", 0) + 1
+                account["error_message"] = error[:500]
+            self._save()
+            self._condition.notify_all()
+
     def list_accounts(self) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._condition:
+            self._restore_expired_cooldowns(time.time())
             return [self._mask_sensitive(dict(acc)) for acc in self._accounts.values()]
+
+    def _restore_expired_cooldowns(self, now: float) -> None:
+        """恢复已到期的持久冷却账号，调用方需持有账号池锁。"""
+        restored = False
+        for account in self._accounts.values():
+            if account.get("status") == "cooldown" and int(account.get("cooldown_until", 0) or 0) <= now:
+                account["status"] = "active"
+                account["cooldown_until"] = 0
+                restored = True
+        if restored:
+            self._save()
+            self._condition.notify_all()
 
     # ── Scheduling ──
 
     def _reserve_available_account(self, task_type: str) -> dict[str, Any] | None:
         norm_type = "image" if task_type == "image" else "chat"
         now = time.time()
+        self._restore_expired_cooldowns(now)
         candidates = []
         for account in self._accounts.values():
             if account.get("status") != "active" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+                continue
+            if self._batches.get(account.get("name") or account.get("email"), {}).get("probing"):
                 continue
             # 临时故障账号在冷却期内不参与普通调度，避免随机再次命中同一故障出口。
             if account.get("cooldown_until", 0) > now:
@@ -121,6 +160,9 @@ class BaseAccountPool:
         if not candidates:
             return None
         selected = self._select_strategy(candidates)
+        key = selected.get("name") or selected.get("email")
+        if selected.get("inflight", 0) == 0:
+            self._batches[key] = {"success": False, "failures": 0, "probing": False, "explicit": False, "error": ""}
         selected[f"inflight_{norm_type}"] = selected.get(f"inflight_{norm_type}", 0) + 1
         selected["inflight"] = selected.get("inflight_image", 0) + selected.get("inflight_chat", 0)
         selected["last_used_at"] = int(now)
@@ -145,7 +187,7 @@ class BaseAccountPool:
                 now = time.time()
                 deadlines = []
                 for candidate in self._accounts.values():
-                    if candidate.get("status") != "active" or candidate.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+                    if candidate.get("status") not in {"active", "cooldown"} or candidate.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
                         continue
                     deadline = max(
                         float(candidate.get("cooldown_until", 0)),
@@ -166,7 +208,7 @@ class BaseAccountPool:
         retry_after: int | None = None,
         task_type: str = "chat",
     ) -> None:
-        """释放账号；失败账号立即停用，成功账号无任何额外冷却。"""
+        """释放单次请求；普通故障在当前并发批次全部结束后才判定账号健康。"""
         norm_type = "image" if task_type == "image" else "chat"
         with self._condition:
             account = self._accounts.get(key)
@@ -175,36 +217,59 @@ class BaseAccountPool:
 
             account[f"inflight_{norm_type}"] = max(0, account.get(f"inflight_{norm_type}", 1) - 1)
             account["inflight"] = account.get("inflight_image", 0) + account.get("inflight_chat", 0)
+            batch = self._batches.setdefault(key, {"success": False, "failures": 0, "probing": False, "explicit": False, "error": ""})
             if success:
-                account["status"] = "active"
-                account["cooldown_until"] = 0
-                account["failure_count"] = 0
-                account["error_message"] = ""
-                self._save()
+                batch["success"] = True
             elif error:
-                account["error_message"] = error[:500]
-                account["failure_count"] = account.get("failure_count", 0) + 1
                 category = self._classify_error(error, status_code)
                 if category == "fatal":
                     account["status"] = "error"
                     account["cooldown_until"] = 0
-                else:
+                    account["error_message"] = error[:500]
+                    account["failure_count"] = account.get("failure_count", 0) + 1
+                    batch["explicit"] = True
+                    self._save()
+                elif category == "rate_limit":
                     account["status"] = "active"
-                    delay = retry_after if retry_after and retry_after > 0 else (
-                        self.RATE_LIMIT_COOLDOWN_SECONDS if category == "rate_limit" else self.TRANSIENT_COOLDOWN_SECONDS
-                    )
-                    account["cooldown_until"] = int(time.time()) + delay
-                self._save()
+                    account["cooldown_until"] = int(time.time()) + (retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
+                    account["error_message"] = error[:500]
+                    account["failure_count"] = account.get("failure_count", 0) + 1
+                    batch["explicit"] = True
+                    self._save()
+                else:
+                    # 暂停新分配，等待本批已在执行的请求给出结果。
+                    batch["failures"] += 1
+                    batch["probing"] = True
+                    batch["error"] = error[:500]
+            if account["inflight"] == 0:
+                if not batch["explicit"]:
+                    if batch["success"]:
+                        account["status"] = "active"
+                        account["cooldown_until"] = 0
+                        account["failure_count"] = 0
+                        account["error_message"] = ""
+                    elif batch["failures"]:
+                        account["status"] = "active"
+                        account["cooldown_until"] = int(time.time()) + self.TRANSIENT_COOLDOWN_SECONDS
+                        account["failure_count"] = account.get("failure_count", 0) + 1
+                        account["error_message"] = batch["error"]
+                    self._save()
+                self._batches.pop(key, None)
             self._condition.notify_all()
 
     def stats(self) -> dict[str, int]:
         with self._lock:
+            now = time.time()
+            self._restore_expired_cooldowns(now)
             return {
                 "total_accounts": len(self._accounts),
                 "active_accounts": sum(
                     1 for a in self._accounts.values() if a.get("status") == "active"
                 ),
-                "cooldown_accounts": 0,
+                "cooldown_accounts": sum(
+                    1 for account in self._accounts.values()
+                    if int(account.get("cooldown_until", 0) or 0) > now
+                ),
                 "total_inflight_tasks": sum(
                     a.get("inflight", 0) for a in self._accounts.values()
                 ),
@@ -220,9 +285,11 @@ class BaseAccountPool:
         """Return the current shared account capacity without reserving a slot."""
         with self._lock:
             now = time.time()
+            self._restore_expired_cooldowns(now)
             usable = [
                 account for account in self._accounts.values()
                 if account.get("status") == "active" and account.get("cooldown_until", 0) <= now
+                and not self._batches.get(account.get("name") or account.get("email"), {}).get("probing")
             ]
             cooldowns = [
                 float(account.get("cooldown_until", 0))
@@ -251,8 +318,8 @@ class BaseAccountPool:
         Override per provider for provider-specific error keywords.
         """
         lower = error.lower()
-        if any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401", "未认证")):
+        if status_code == 401 or any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401", "未认证")):
             return "fatal"
-        if status_code == 429 or any(kw in lower for kw in ("quota", "rate limit", "too many")):
+        if status_code == 429 or any(kw in lower for kw in ("quota", "rate limit", "too many", "429")):
             return "rate_limit"
         return "transient"
