@@ -61,7 +61,7 @@ class OpenAIAccountPool(BaseAccountPool):
 
         with self._condition:
             self._accounts[email] = account
-            self._save()
+            self._save(email)
             self._condition.notify_all()
 
         return account
@@ -92,7 +92,7 @@ class OpenAIAccountPool(BaseAccountPool):
                 account["cooldown_until"] = 0
                 account["failure_count"] = 0
                 account["error_message"] = ""
-                self._save()
+                self._save(email)
                 self._condition.notify_all()
             return account
         except Exception as exc:
@@ -102,7 +102,7 @@ class OpenAIAccountPool(BaseAccountPool):
                     account["status"] = "error"
                     account["cooldown_until"] = 0
                 account["error_message"] = str(exc)
-                self._save()
+                self._save(email)
                 self._condition.notify_all()
             raise
 
@@ -123,7 +123,7 @@ class OpenAIAccountPool(BaseAccountPool):
                         if account_copy["email"] in self._accounts:
                             self._accounts[account_copy["email"]]["access_token"] = new_token
                             self._accounts[account_copy["email"]]["access_token_expires_at"] = expires_at
-                            self._save()
+                            self._save(account_copy["email"])
                     account_copy["access_token"] = new_token
             except Exception as exc:
                 logger.warning(f"Failed pre-refreshing token for {account_copy['email']}: {exc}")
@@ -220,7 +220,7 @@ class OpenAIAccountPool(BaseAccountPool):
                 raise ValueError(f"Account {email} not found")
             current["supported_models"] = models
             current["models_updated_at"] = int(datetime.now(timezone.utc).timestamp())
-            self._save()
+            self._save(email)
             self._condition.notify_all()
         return models
 

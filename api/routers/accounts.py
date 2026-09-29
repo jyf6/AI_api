@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from api.schemas import DoubaoAccountRequest, GeminiAccountRequest
+from api.schemas import AccountCookieUpdateRequest, DoubaoAccountRequest, GeminiAccountRequest
 from providers.openai.account import account_service
 from providers.doubao.account import doubao_account_service
 from providers.gemini.account import gemini_account_service
@@ -87,6 +87,19 @@ async def add_doubao_account(body: DoubaoAccountRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.put("/api/doubao/accounts/{name}/cookie")
+async def update_doubao_cookie(name: str, body: AccountCookieUpdateRequest):
+    """只更新 Cookie，账号池会保留该账号原有代理节点。"""
+    try:
+        if not doubao_account_service.update_cookie(name, body.cookie):
+            raise HTTPException(status_code=404, detail="Doubao account not found")
+        return {"name": name, "status": "active"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.delete("/api/doubao/accounts/{name}")
 async def delete_doubao_account(name: str):
     if not doubao_account_service.delete_account(name):
@@ -139,6 +152,20 @@ async def add_gemini_account(body: GeminiAccountRequest):
     except Exception as exc:
         if "account" in locals():
             gemini_account_service.mark_refresh_verification_failed(account["name"], exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.put("/api/gemini/accounts/{name}/cookie")
+async def update_gemini_cookie(name: str, body: AccountCookieUpdateRequest):
+    """替换 Gemini Cookie、清理旧客户端，并保留数据库中的代理节点。"""
+    try:
+        await gemini_account_service.discard_client(name)
+        if not gemini_account_service.update_cookie(name, body.cookie):
+            raise HTTPException(status_code=404, detail="Gemini account not found")
+        return {"name": name, "status": "active"}
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 

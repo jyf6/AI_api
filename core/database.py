@@ -20,8 +20,9 @@ class Database:
             raise RuntimeError("账户存储只支持 MySQL，请设置 STORAGE_BACKEND=mysql")
 
     def _connect(self):
+        # 部署时必须显式提供数据库密码，不使用开发环境的固定密码。
         return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"), port=int(os.getenv("MYSQL_PORT", "3306")),
-                               user=os.getenv("MYSQL_USER", "root"), password=os.getenv("MYSQL_PASSWORD", "123456"),
+                               user=os.getenv("MYSQL_USER", "root"), password=os.environ["MYSQL_PASSWORD"],
                                database=os.getenv("MYSQL_DATABASE", "flexi_admin"), charset="utf8mb4",
                                cursorclass=DictCursor, autocommit=True)
 

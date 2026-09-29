@@ -44,3 +44,9 @@ class GeminiAccountRequest(BaseModel):
     proxy: str = ""
 
 
+class AccountCookieUpdateRequest(BaseModel):
+    """仅更新账号 Cookie，代理节点由服务端保留原值。"""
+
+    cookie: str = Field(..., min_length=1)
+
+

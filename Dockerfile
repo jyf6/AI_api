@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir uv
 
 COPY pyproject.toml uv.lock ./
 # Gemini 网页端逆向通过 HTTP 协议工作，不需要下载 Chromium 浏览器运行时。
-RUN uv sync --frozen --no-dev --no-install-project
+ARG UV_HTTP_TIMEOUT=180
+RUN UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT} uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
 COPY api ./api

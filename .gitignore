@@ -10,10 +10,7 @@ web_dist
 .venv
 .idea
 data
-config.json
 edit
-
-docker-compose-local.yml
 
 .claude/settings.local.json
 
@@ -33,3 +30,4 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+docker-build*.log*

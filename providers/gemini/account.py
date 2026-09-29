@@ -88,35 +88,39 @@ class GeminiAccountPool(BaseAccountPool):
                 raise ValueError(f"该 __Secure-1PSID 已被账号 [{duplicate}] 使用")
             _clear_cached_cookies_for_psids(previous.get("psid", ""), psid)
             self._accounts[account["name"]] = account
-            self._save()
+            self._save(account["name"])
             self._condition.notify_all()
         return account
 
     # ── Gemini-specific: cookie management ──
 
-    def update_cookie(self, name: str, cookie: str) -> None:
+    def update_cookie(self, name: str, cookie: str) -> bool:
         psid, psidts = _parse_auth_cookie(cookie)
         with self._condition:
-            if name in self._accounts and cookie:
-                old_psid = self._accounts[name].get("psid", "")
-                duplicate = next(
-                    (existing_name for existing_name, existing in self._accounts.items()
-                     if existing_name != name and existing.get("psid") == psid),
-                    None,
-                )
-                if duplicate:
-                    raise ValueError(f"该 __Secure-1PSID 已被账号 [{duplicate}] 使用")
-                self._accounts[name]["cookie"] = _auth_cookie_header(psid, psidts)
-                self._accounts[name]["psid"] = psid
-                self._accounts[name]["psidts"] = psidts
-                # 手工更新值优先，清理同账号旧 PSID 的磁盘会话缓存。
-                _clear_cached_cookies_for_psids(old_psid, self._accounts[name]["psid"])
-                # 更新 Cookie 即视为人工恢复账号，重新加入调度。
-                self._accounts[name]["status"] = "active"
-                self._accounts[name]["failure_count"] = 0
-                self._accounts[name]["error_message"] = ""
-                self._save()
-                self._condition.notify_all()
+            account = self._accounts.get(name)
+            if account is None:
+                return False
+            old_psid = account.get("psid", "")
+            duplicate = next(
+                (existing_name for existing_name, existing in self._accounts.items()
+                 if existing_name != name and existing.get("psid") == psid),
+                None,
+            )
+            if duplicate:
+                raise ValueError(f"该 __Secure-1PSID 已被账号 [{duplicate}] 使用")
+            account["cookie"] = _auth_cookie_header(psid, psidts)
+            account["psid"] = psid
+            account["psidts"] = psidts
+            # 手工更新值优先，清理同账号旧 PSID 的磁盘会话缓存。
+            _clear_cached_cookies_for_psids(old_psid, psid)
+            # 更新 Cookie 即视为人工恢复账号，代理与在途请求计数保持不变。
+            account["status"] = "active"
+            account["cooldown_until"] = 0
+            account["failure_count"] = 0
+            account["error_message"] = ""
+            self._save(name)
+            self._condition.notify_all()
+            return True
 
     def merge_cookie(self, name: str, updates: dict[str, str]) -> None:
         with self._lock:
@@ -130,7 +134,7 @@ class GeminiAccountPool(BaseAccountPool):
             account["cookie"] = _auth_cookie_header(psid, psidts)
             account["psid"] = psid
             account["psidts"] = psidts
-            self._save()
+            self._save(name)
 
     @staticmethod
     def is_auth_error(error: Exception | str) -> bool:
@@ -147,7 +151,7 @@ class GeminiAccountPool(BaseAccountPool):
             account["status"] = "error"
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500] or "Gemini Cookie 未认证，请更新 Cookie"
-            self._save()
+            self._save(name)
             self._condition.notify_all()
 
     def mark_refresh_verification_failed(self, name: str, error: Exception | str) -> None:
@@ -161,7 +165,7 @@ class GeminiAccountPool(BaseAccountPool):
             account["cooldown_until"] = int(time.time() + 300)
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500]
-            self._save()
+            self._save(name)
             self._condition.notify_all()
 
     async def verify_refreshed_client(self, name: str, client: Any) -> None:
@@ -177,7 +181,7 @@ class GeminiAccountPool(BaseAccountPool):
                 account["cooldown_until"] = 0
                 account["failure_count"] = 0
                 account["error_message"] = ""
-                self._save()
+                self._save(name)
                 self._condition.notify_all()
             logger.info(f"[Gemini Refresh Verify] 账号 [{name}] 续期后真实测试成功，已同步 Cookie")
         except Exception as exc:
@@ -239,7 +243,7 @@ class GeminiAccountPool(BaseAccountPool):
                         current["cooldown_until"] = 0
                         current["failure_count"] = 0
                         current["error_message"] = ""
-                        self._save()
+                        self._save(name)
                     self._clients[name] = client
                     return client
                 except AuthError as exc:
@@ -403,7 +407,7 @@ class GeminiAccountPool(BaseAccountPool):
                 raise ValueError(f"Account {name} not found")
             current["supported_models"] = models
             current["models_updated_at"] = int(time.time())
-            self._save()
+            self._save(name)
             self._condition.notify_all()
         return models
 

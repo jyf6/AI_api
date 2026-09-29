@@ -19,7 +19,6 @@ class BaseAccountPool:
 
     MAX_INFLIGHT_TOTAL: int = 4
     MIN_DISPATCH_INTERVAL_SECONDS: float = 1.0
-    TRANSIENT_COOLDOWN_SECONDS: int = 30
     RATE_LIMIT_COOLDOWN_SECONDS: int = 300
     PROVIDER_NAME: str = "base"
 
@@ -61,9 +60,15 @@ class BaseAccountPool:
             logger.error(f"Failed to load {self._data_file.name}: {exc}")
             return {}
 
-    def _save(self) -> None:
+    def _save(self, account_key: str | None = None) -> None:
         if self._platform:
-            for key, account in self._accounts.items():
+            if account_key is None:
+                accounts = self._accounts.items()
+            elif account_key in self._accounts:
+                accounts = ((account_key, self._accounts[account_key]),)
+            else:
+                return
+            for key, account in accounts:
                 credentials = {
                     k: v for k, v in account.items()
                     if k not in {
@@ -99,7 +104,8 @@ class BaseAccountPool:
             self._batches.pop(key, None)
             if self._platform:
                 database.delete_account(self._platform, key)
-            self._save()
+            elif self._data_file is not None:
+                self._save()
             return True
 
     def set_account_health(self, key: str, healthy: bool, error: str = "") -> None:
@@ -119,7 +125,7 @@ class BaseAccountPool:
                 account["cooldown_until"] = 0
                 account["failure_count"] = account.get("failure_count", 0) + 1
                 account["error_message"] = error[:500]
-            self._save()
+            self._save(key)
             self._condition.notify_all()
 
     def list_accounts(self) -> list[dict[str, Any]]:
@@ -129,14 +135,15 @@ class BaseAccountPool:
 
     def _restore_expired_cooldowns(self, now: float) -> None:
         """恢复已到期的持久冷却账号，调用方需持有账号池锁。"""
-        restored = False
-        for account in self._accounts.values():
+        restored_keys = []
+        for key, account in self._accounts.items():
             if account.get("status") == "cooldown" and int(account.get("cooldown_until", 0) or 0) <= now:
                 account["status"] = "active"
                 account["cooldown_until"] = 0
-                restored = True
-        if restored:
-            self._save()
+                restored_keys.append(key)
+        if restored_keys:
+            for key in restored_keys:
+                self._save(key)
             self._condition.notify_all()
 
     # ── Scheduling ──
@@ -215,6 +222,11 @@ class BaseAccountPool:
             if not account:
                 return
 
+            previous_health = (
+                account.get("status"), account.get("cooldown_until", 0),
+                account.get("failure_count", 0), account.get("error_message", ""),
+            )
+
             account[f"inflight_{norm_type}"] = max(0, account.get(f"inflight_{norm_type}", 1) - 1)
             account["inflight"] = account.get("inflight_image", 0) + account.get("inflight_chat", 0)
             batch = self._batches.setdefault(key, {"success": False, "failures": 0, "probing": False, "explicit": False, "error": ""})
@@ -228,14 +240,14 @@ class BaseAccountPool:
                     account["error_message"] = error[:500]
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
-                    self._save()
+                    self._save(key)
                 elif category == "rate_limit":
                     account["status"] = "active"
                     account["cooldown_until"] = int(time.time()) + (retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
                     account["error_message"] = error[:500]
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
-                    self._save()
+                    self._save(key)
                 else:
                     # 暂停新分配，等待本批已在执行的请求给出结果。
                     batch["failures"] += 1
@@ -250,10 +262,15 @@ class BaseAccountPool:
                         account["error_message"] = ""
                     elif batch["failures"]:
                         account["status"] = "active"
-                        account["cooldown_until"] = int(time.time()) + self.TRANSIENT_COOLDOWN_SECONDS
+                        account["cooldown_until"] = 0
                         account["failure_count"] = account.get("failure_count", 0) + 1
                         account["error_message"] = batch["error"]
-                    self._save()
+                    current_health = (
+                        account.get("status"), account.get("cooldown_until", 0),
+                        account.get("failure_count", 0), account.get("error_message", ""),
+                    )
+                    if current_health != previous_health:
+                        self._save(key)
                 self._batches.pop(key, None)
             self._condition.notify_all()
 
@@ -318,8 +335,15 @@ class BaseAccountPool:
         Override per provider for provider-specific error keywords.
         """
         lower = error.lower()
-        if status_code == 401 or any(kw in lower for kw in ("token", "invalid", "unauthorized", "deactivated", "expired", "401", "未认证")):
+        if status_code == 401 or any(kw in lower for kw in (
+            "invalid_grant", "invalid token", "token expired", "expired token", "unauthorized",
+            "unauthenticated", "authentication failed", "account disabled", "deactivated", "401",
+            "未认证", "登录失效", "cookie 无效", "cookie无效",
+        )):
             return "fatal"
-        if status_code == 429 or any(kw in lower for kw in ("quota", "rate limit", "too many", "429")):
+        if status_code == 429 or any(kw in lower for kw in (
+            "quota", "rate limit", "too many", "429", "insufficient_quota", "quota exhausted",
+            "quota exceeded", "credits exhausted", "额度不足", "额度耗尽",
+        )):
             return "rate_limit"
         return "transient"

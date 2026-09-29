@@ -11,9 +11,8 @@ class DoubaoAccountPool(BaseAccountPool):
     """Doubao account pool: Cookie-based authentication."""
 
     PROVIDER_NAME = "Doubao"
-    # 严格单并发：同一个 Cookie 禁止多线程同时请求，必须排队串行
-    MAX_INFLIGHT_TOTAL = 1
-    # 调度最小间隔：同一账号连续两次被调度之间强制保持在 2.0 秒以上
+    # 豆包与其他平台一样每个账号最多四个在途请求，账号调度起始间隔为两秒。
+    MAX_INFLIGHT_TOTAL = 4
     MIN_DISPATCH_INTERVAL_SECONDS = 2.0
 
     def __init__(self) -> None:
@@ -36,9 +35,27 @@ class DoubaoAccountPool(BaseAccountPool):
         }
         with self._condition:
             self._accounts[account["name"]] = account
-            self._save()
+            self._save(account["name"])
             self._condition.notify_all()
         return account
+
+    def update_cookie(self, name: str, cookie: str) -> bool:
+        """更新豆包 Cookie 并保留当前代理及在途请求计数。"""
+        cookies = parse_cookie_string(cookie)
+        if not cookies.get("sessionid"):
+            raise ValueError("Cookie 中缺少 sessionid")
+        with self._condition:
+            account = self._accounts.get(name)
+            if account is None:
+                return False
+            account["cookies"] = cookies
+            account["status"] = "active"
+            account["cooldown_until"] = 0
+            account["failure_count"] = 0
+            account["error_message"] = ""
+            self._save(name)
+            self._condition.notify_all()
+            return True
 
     # ── Hooks ──
 
@@ -53,7 +70,8 @@ class DoubaoAccountPool(BaseAccountPool):
     def _classify_error(self, error: str, status_code: int | None = None) -> str:
         lower = error.lower()
         if status_code == 401 or any(word in lower for word in (
-            "login", "session", "unauthorized", "expired", "401", "cookie invalid",
+            "login failed", "login required", "session expired", "cookie expired", "login expired",
+            "unauthorized", "401", "cookie invalid",
             "invalid cookie", "\u767b\u5f55\u5931\u6548", "\u767b\u9646\u5931\u6548",
             "\u5df2\u5931\u6548",
             "\u672a\u767b\u5f55", "\u4f1a\u8bdd\u8fc7\u671f", "\u8ba4\u8bc1\u5931\u8d25",
@@ -61,7 +79,10 @@ class DoubaoAccountPool(BaseAccountPool):
             "\u767b\u9646\u8fc7\u671f",
         )):
             return "fatal"
-        if status_code == 429 or any(word in lower for word in ("rate limit", "too many", "429", "\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41")):
+        if status_code == 429 or any(word in lower for word in (
+            "rate limit", "too many", "429", "quota", "credits exhausted",
+            "\u989d\u5ea6", "\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41",
+        )):
             return "rate_limit"
         return "transient"
 
