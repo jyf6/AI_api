@@ -4,6 +4,7 @@ import base64
 import json
 import secrets
 from datetime import datetime, timezone
+from threading import Event
 from typing import Any
 
 from core.account_pool import BaseAccountPool
@@ -18,13 +19,18 @@ class OpenAIAccountPool(BaseAccountPool):
 
     def __init__(self) -> None:
         super().__init__(platform="gpt")
+        # 旧账号仅在首次升级时补发设备 ID，后续客户端始终复用该账号身份。
+        for email, account in self._accounts.items():
+            if not account.get("device_id"):
+                account["device_id"] = secrets.token_hex(16)
+                self._save(email)
 
     # ── OAuth integration ──
 
     def start_oauth_session(self) -> dict[str, str]:
         return oauth_manager.start_session()
 
-    def finish_oauth_session(self, callback_url: str, proxy: str = "", session_id: str = "") -> dict[str, Any]:
+    def finish_oauth_session(self, callback_url: str, proxy: str = "", session_id: str = "", proxy_id: int | None = None) -> dict[str, Any]:
         """Exchange callback URL for tokens and store account in pool."""
         data = oauth_manager.finish_session(callback_url, proxy, session_id)
         access_token = str(data.get("access_token") or "").strip()
@@ -50,6 +56,9 @@ class OpenAIAccountPool(BaseAccountPool):
             "access_token": access_token,
             "access_token_expires_at": expires_at,
             "proxy": proxy.strip(),
+            "proxy_id": proxy_id,
+            "proxy_status": "active" if proxy_id else None,
+            "device_id": secrets.token_hex(16),
             "plan_type": plan_type,
             "status": "active",
             "inflight": 0,
@@ -60,6 +69,12 @@ class OpenAIAccountPool(BaseAccountPool):
         }
 
         with self._condition:
+            previous = self._accounts.get(email, {})
+            if not proxy and not proxy_id:
+                account["proxy"] = previous.get("proxy", "")
+                account["proxy_id"] = previous.get("proxy_id")
+                account["proxy_status"] = previous.get("proxy_status")
+            account["device_id"] = previous.get("device_id") or account["device_id"]
             self._accounts[email] = account
             self._save(email)
             self._condition.notify_all()
@@ -133,8 +148,8 @@ class OpenAIAccountPool(BaseAccountPool):
     def get_available_account(self, task_type: str = "chat") -> dict[str, Any]:
         return self._prepare_account(super().get_available_account(task_type=task_type))
 
-    def wait_for_available_account(self, task_type: str = "chat") -> dict[str, Any]:
-        return self._prepare_account(super().wait_for_available_account(task_type=task_type))
+    def wait_for_available_account(self, task_type: str = "chat", cancelled: Event | None = None) -> dict[str, Any]:
+        return self._prepare_account(super().wait_for_available_account(task_type=task_type, cancelled=cancelled))
 
     # ── Hooks ──
 
@@ -183,7 +198,7 @@ class OpenAIAccountPool(BaseAccountPool):
     def _discover_models(self, account: dict[str, Any]) -> list[dict[str, str]]:
         try:
             from providers.openai.backend import OpenAIBackendAPI
-            with OpenAIBackendAPI(account.get("access_token", ""), account.get("proxy", "")) as backend:
+            with OpenAIBackendAPI(account.get("access_token", ""), account.get("proxy", ""), account.get("device_id", "")) as backend:
                 path = "/backend-api/models"
                 res = backend.session.get(backend.base_url + path, headers=backend._headers(path), timeout=4)
                 if res.status_code == 200:

@@ -4,6 +4,15 @@ from typing import Any, Iterator
 from curl_cffi import requests
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+_TRANSPORT_EXCEPTION_NAMES = {
+    "connectionerror", "connecterror", "connecttimeout", "readtimeout", "writetimeout",
+    "timeouterror", "timeout", "curlerror", "certificateverifyerror", "sslerror", "dnserror",
+    "clientconnectionerror", "clientconnectorerror", "clientconnectordnserror",
+    "clientconnectorcertificateerror", "clienthttpproxyerror", "clientoserror",
+    "clientproxyconnectionerror", "proxyerror", "proxyconnectionerror", "proxyconnecterror",
+    "proxytimeouterror", "socksconnectionerror", "serverdisconnectederror", "servertimeouterror",
+    "networkerror", "urlerror",
+}
 
 
 
@@ -41,6 +50,17 @@ class ImageQuotaExceededError(RuntimeError):
     def __init__(self, message: str, retry_after: int) -> None:
         self.retry_after = retry_after
         super().__init__(f"[image_quota_exhausted] {message}")
+
+
+def is_transport_error(error: BaseException) -> bool:
+    """判断异常链是否明确属于网络传输层，避免把代理故障累计到账户健康度。"""
+    current: BaseException | None = error
+    while current is not None:
+        name = type(current).__name__.lower()
+        if name in _TRANSPORT_EXCEPTION_NAMES or name.endswith(("connecterror", "connecttimeout", "readtimeout")):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def ensure_ok(response: requests.Response, context: str) -> None:

@@ -60,7 +60,7 @@ class GeminiAccountPool(BaseAccountPool):
 
     # ── Cookie-based Account Integration ──
 
-    def add_account(self, name: str, cookie: str, proxy: str = "") -> dict[str, Any]:
+    def add_account(self, name: str, cookie: str, proxy: str = "", proxy_id: int | None = None) -> dict[str, Any]:
         psid, psidts = _parse_auth_cookie(cookie)
         account_name = name.strip() or f"gemini-{int(time.time())}"
         account = {
@@ -69,6 +69,8 @@ class GeminiAccountPool(BaseAccountPool):
             "psid": psid,
             "psidts": psidts,
             "proxy": proxy.strip(),
+            "proxy_id": proxy_id,
+            "proxy_status": "active" if proxy_id else None,
             "status": "active",
             "inflight": 0,
             "cooldown_until": 0,

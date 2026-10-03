@@ -1,0 +1,57 @@
+name: Test and deploy Python service
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chatgpt2api-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v9
+        with:
+          version: '0.12.21'
+      - name: Install dependencies
+        run: uv sync --locked --no-install-project --python 3.12
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q tests
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SSH_HOST: 43.142.87.80
+      SSH_USER: ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package service
+        run: tar -czf chatgpt2api.tar.gz main.py api core providers utils pyproject.toml uv.lock README.md
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          cp deploy/known_hosts ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
+      - name: Upload and deploy
+        run: |
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/id_deploy \
+            chatgpt2api.tar.gz deploy/deploy.sh "$SSH_USER@$SSH_HOST:/tmp/"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/id_deploy \
+            "$SSH_USER@$SSH_HOST" \
+            "bash /tmp/deploy.sh '$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT' /tmp/chatgpt2api.tar.gz"

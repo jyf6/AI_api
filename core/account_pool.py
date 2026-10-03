@@ -1,14 +1,39 @@
 from __future__ import annotations
 
+import asyncio
 import json
-import random
 import time
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
-from threading import Condition, Lock
-from typing import Any
+from threading import Condition, Event, Lock
+from typing import Any, Callable, TypeVar
 
-from utils.log import logger
+from utils.log import logger, proxy_log_ref, stable_log_ref
 from core.database import database
+
+
+class AccountWaitCancelled(Exception):
+    """等待中的请求已取消，账号尚未交给业务调用。"""
+
+
+T = TypeVar("T")
+
+
+async def await_thread_result(call: Callable[[], T]) -> T:
+    """取消 HTTP 请求后仍等待工作线程自行收尾，避免提前释放账号。"""
+    worker = asyncio.create_task(asyncio.to_thread(call))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # shield 保证工作线程执行 finally；取走后台异常以免丢失失败记录。
+        def observe_completion(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                logger.warning("已取消请求的上游线程失败 reason=%s", type(exc).__name__)
+
+        worker.add_done_callback(observe_completion)
+        raise
 
 
 class BaseAccountPool:
@@ -69,10 +94,15 @@ class BaseAccountPool:
             else:
                 return
             for key, account in accounts:
+                if account.get("proxy") and not account.get("proxy_id"):
+                    proxy_id = database.ensure_proxy_node(account["proxy"])
+                    node = database.get_proxy_node(proxy_id)
+                    account["proxy_id"] = proxy_id
+                    account["proxy_status"] = node["status"]
                 credentials = {
                     k: v for k, v in account.items()
                     if k not in {
-                        "name", "email", "proxy", "status",
+                        "name", "email", "proxy", "proxy_id", "proxy_status", "status",
                         "inflight", "inflight_image", "inflight_chat",
                         "last_used_at", "last_dispatched_at", "cooldown_until", "failure_count", "error_message"
                     }
@@ -81,7 +111,7 @@ class BaseAccountPool:
                     self._platform, key, credentials,
                     account.get("proxy", ""), account.get("status", "active"),
                     int(account.get("cooldown_until", 0)), int(account.get("failure_count", 0)),
-                    account.get("error_message", "")
+                    account.get("error_message", ""), account.get("proxy_id")
                 )
             return
         if self._data_file is None:
@@ -108,6 +138,46 @@ class BaseAccountPool:
                 self._save()
             return True
 
+    def set_account_proxy(self, key: str, proxy_id: int | None) -> bool:
+        """固定或清除账号的代理绑定，并立即更新运行时账号。"""
+        with self._condition:
+            account = self._accounts.get(key)
+            if account is None:
+                return False
+            if proxy_id:
+                node = database.get_proxy_node(proxy_id)
+                if not node:
+                    raise ValueError(f"Proxy node {proxy_id} not found")
+                if node["status"] != "active":
+                    raise ValueError("不能将账号绑定到已停用的代理")
+                account["proxy"] = node["proxy_url"]
+                account["proxy_status"] = node["status"]
+                account["proxy_id"] = proxy_id
+            else:
+                account["proxy"] = ""
+                account["proxy_status"] = None
+                account["proxy_id"] = None
+            self._save(key)
+            self._condition.notify_all()
+            return True
+
+    def refresh_proxy_node(self, proxy_id: int, proxy_url: str, status: str) -> None:
+        """同步运行中的账号所绑定节点的最新地址和启停状态。"""
+        with self._condition:
+            for account in self._accounts.values():
+                if account.get("proxy_id") == proxy_id:
+                    account["proxy"] = proxy_url
+                    account["proxy_status"] = status
+            self._condition.notify_all()
+
+    def refresh_proxy_status(self, proxy_id: int, status: str) -> None:
+        """节点启停变更立即对当前账号调度生效。"""
+        with self._condition:
+            for account in self._accounts.values():
+                if account.get("proxy_id") == proxy_id:
+                    account["proxy_status"] = status
+            self._condition.notify_all()
+
     def set_account_health(self, key: str, healthy: bool, error: str = "") -> None:
         """Update verified account health without changing task in-flight counters."""
         with self._condition:
@@ -120,18 +190,37 @@ class BaseAccountPool:
                 account["failure_count"] = 0
                 account["error_message"] = ""
                 self._batches.pop(key, None)
+                logger.info("event=account_health_verified platform=%s account_ref=%s status=active",
+                            self._platform, stable_log_ref(f"{self._platform}-account", key))
             else:
                 account["status"] = "error"
                 account["cooldown_until"] = 0
                 account["failure_count"] = account.get("failure_count", 0) + 1
                 account["error_message"] = error[:500]
+                logger.warning("event=account_health_verification_failed platform=%s account_ref=%s reason=%s",
+                               self._platform, stable_log_ref(f"{self._platform}-account", key),
+                               "verification_failed")
             self._save(key)
             self._condition.notify_all()
 
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._condition:
             self._restore_expired_cooldowns(time.time())
-            return [self._mask_sensitive(dict(acc)) for acc in self._accounts.values()]
+            result = []
+            for acc in self._accounts.values():
+                safe = dict(acc)
+                for secret_identity in ("device_id", "web_id", "fp"):
+                    safe.pop(secret_identity, None)
+                if safe.get("proxy"):
+                    parts = urlsplit(safe["proxy"])
+                    host = parts.hostname or ""
+                    if ":" in host:
+                        host = f"[{host}]"
+                    if parts.port:
+                        host = f"{host}:{parts.port}"
+                    safe["proxy"] = urlunsplit((parts.scheme, host, "", "", ""))
+                result.append(self._mask_sensitive(safe))
+            return result
 
     def _restore_expired_cooldowns(self, now: float) -> None:
         """恢复已到期的持久冷却账号，调用方需持有账号池锁。"""
@@ -154,7 +243,7 @@ class BaseAccountPool:
         self._restore_expired_cooldowns(now)
         candidates = []
         for account in self._accounts.values():
-            if account.get("status") != "active" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+            if account.get("status") != "active" or account.get("proxy_status") == "disabled" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
                 continue
             if self._batches.get(account.get("name") or account.get("email"), {}).get("probing"):
                 continue
@@ -184,13 +273,22 @@ class BaseAccountPool:
                 raise RuntimeError(f"No available {self.PROVIDER_NAME} accounts for task_type '{task_type}'")
             return account
 
-    def wait_for_available_account(self, task_type: str = "chat") -> dict[str, Any]:
+    def wait_for_available_account(self, task_type: str = "chat", cancelled: Event | None = None) -> dict[str, Any]:
         """业务请求在账号忙碌时等待释放，不因正常占用而失败。"""
         with self._condition:
             while True:
+                # 取消检查与预订处于同一把锁下，避免唤醒后仍占用账号。
+                if cancelled is not None and cancelled.is_set():
+                    raise AccountWaitCancelled()
                 account = self._reserve_available_account(task_type)
                 if account is not None:
                     return account
+                if not any(
+                    candidate.get("status") in {"active", "cooldown"}
+                    and candidate.get("proxy_status") != "disabled"
+                    for candidate in self._accounts.values()
+                ):
+                    raise RuntimeError(f"No available {self.PROVIDER_NAME} accounts for task_type '{task_type}'")
                 now = time.time()
                 deadlines = []
                 for candidate in self._accounts.values():
@@ -206,6 +304,31 @@ class BaseAccountPool:
                 timeout = max(0.01, min(deadlines) - now) if deadlines else None
                 self._condition.wait(timeout)
 
+    async def acquire_account(self, task_type: str = "chat") -> dict[str, Any]:
+        """异步等待账号；取消后回收与取消同时完成的预订。"""
+        cancelled = Event()
+        waiter = asyncio.create_task(asyncio.to_thread(self.wait_for_available_account, task_type, cancelled))
+        try:
+            return await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            cancelled.set()
+            with self._condition:
+                self._condition.notify_all()
+
+            def release_abandoned(done: asyncio.Task) -> None:
+                try:
+                    account = done.result()
+                except AccountWaitCancelled:
+                    return
+                except Exception as exc:
+                    logger.warning("取消后的账号等待结束异常 platform=%s reason=%s", self._platform, type(exc).__name__)
+                    return
+                key = account.get("name") or account.get("email")
+                self.release_account(key, False, task_type=task_type)
+
+            waiter.add_done_callback(release_abandoned)
+            raise
+
     def release_account(
         self,
         key: str,
@@ -214,6 +337,7 @@ class BaseAccountPool:
         status_code: int | None = None,
         retry_after: int | None = None,
         task_type: str = "chat",
+        failure_scope: str = "account",
     ) -> None:
         """释放单次请求；普通故障在当前并发批次全部结束后才判定账号健康。"""
         norm_type = "image" if task_type == "image" else "chat"
@@ -233,7 +357,12 @@ class BaseAccountPool:
             if success:
                 batch["success"] = True
             elif error:
-                category = self._classify_error(error, status_code)
+                # 明确的上游认证/限流响应仍归账号；代理握手等传输异常不按错误正文误判账号。
+                category = (
+                    self._classify_error(error, status_code)
+                    if failure_scope != "transport" or status_code in {401, 429}
+                    else "transient"
+                )
                 if category == "fatal":
                     account["status"] = "error"
                     account["cooldown_until"] = 0
@@ -241,6 +370,8 @@ class BaseAccountPool:
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
                     self._save(key)
+                    logger.error("event=account_marked_error platform=%s account_ref=%s status_code=%s",
+                                 self._platform, stable_log_ref(f"{self._platform}-account", key), status_code)
                 elif category == "rate_limit":
                     account["status"] = "active"
                     account["cooldown_until"] = int(time.time()) + (retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
@@ -248,11 +379,23 @@ class BaseAccountPool:
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
                     self._save(key)
+                    logger.warning("event=account_rate_limited platform=%s account_ref=%s status_code=%s cooldown_seconds=%d",
+                                   self._platform, stable_log_ref(f"{self._platform}-account", key), status_code,
+                                   retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
+                elif failure_scope == "transport":
+                    batch["probing"] = True
+                    if account.get("proxy_id"):
+                        database.record_proxy_failure(account["proxy_id"])
+                    logger.warning("event=proxy_transport_failure platform=%s account_ref=%s proxy_ref=%s status_code=%s",
+                                   self._platform, stable_log_ref(f"{self._platform}-account", key),
+                                   proxy_log_ref(account), status_code)
                 else:
                     # 暂停新分配，等待本批已在执行的请求给出结果。
                     batch["failures"] += 1
                     batch["probing"] = True
                     batch["error"] = error[:500]
+                    logger.warning("event=account_transient_failure platform=%s account_ref=%s status_code=%s",
+                                   self._platform, stable_log_ref(f"{self._platform}-account", key), status_code)
             if account["inflight"] == 0:
                 if not batch["explicit"]:
                     if batch["success"]:
@@ -271,6 +414,9 @@ class BaseAccountPool:
                     )
                     if current_health != previous_health:
                         self._save(key)
+                        if account.get("status") == "active" and batch["success"]:
+                            logger.info("event=account_recovered platform=%s account_ref=%s",
+                                        self._platform, stable_log_ref(f"{self._platform}-account", key))
                 self._batches.pop(key, None)
             self._condition.notify_all()
 
@@ -306,6 +452,7 @@ class BaseAccountPool:
             usable = [
                 account for account in self._accounts.values()
                 if account.get("status") == "active" and account.get("cooldown_until", 0) <= now
+                and account.get("proxy_status") != "disabled"
                 and not self._batches.get(account.get("name") or account.get("email"), {}).get("probing")
             ]
             cooldowns = [
@@ -323,8 +470,10 @@ class BaseAccountPool:
     # ── Hooks (override in subclasses) ──
 
     def _select_strategy(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
-        """每次调用从当前可用账号中随机选择，不与任务绑定。"""
-        return random.choice(candidates)
+        """优先派发给最近最少使用的账号；同等时优先较少在途请求。"""
+        return min(candidates, key=lambda account: (
+            account.get("last_dispatched_at", 0.0), account.get("inflight", 0),
+        ))
 
     def _mask_sensitive(self, account: dict[str, Any]) -> dict[str, Any]:
         """Mask sensitive fields for list display. Override per provider."""

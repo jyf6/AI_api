@@ -4,11 +4,14 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 
 from api.schemas import ChatCompletionRequest
+from core.account_pool import await_thread_result
 from core.router import resolve_model
 from providers.doubao.account import doubao_account_service
 from providers.doubao.backend import DoubaoBackendAPI
@@ -16,8 +19,8 @@ from providers.gemini.account import gemini_account_service
 from providers.gemini.backend import GeminiBackendAPI
 from providers.openai.account import account_service
 from providers.openai.backend import OpenAIBackendAPI
-from utils.helper import UpstreamHTTPError
-from utils.log import logger
+from utils.helper import UpstreamHTTPError, is_transport_error
+from utils.log import logger, proxy_log_ref, stable_log_ref
 
 router = APIRouter(tags=["chat"])
 
@@ -80,57 +83,92 @@ def is_anomalous_text(text: str) -> bool:
     return text_len < 40 or text_len > 4000
 
 
-async def _execute_chat_once(resolved: Any, prompt: str, images: list[str]) -> str:
+async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], request_id: str, attempt: int) -> str:
     """执行单次大模型多模态对话推理，管理对应平台的账号生命周期。"""
     if resolved.platform == "gemini":
-        account = await asyncio.to_thread(gemini_account_service.wait_for_available_account, "chat")
+        account = await gemini_account_service.acquire_account("chat")
+        account_ref = stable_log_ref("gemini-account", account.get("name"))
+        proxy_ref = proxy_log_ref(account)
+        logger.info("event=upstream_attempt_started request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
+                    request_id, attempt, account_ref, proxy_ref)
         try:
             async with GeminiBackendAPI(account) as backend:
                 text = await backend.chat(prompt, images, resolved.model)
+            logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
+                        request_id, attempt, account_ref, proxy_ref)
             gemini_account_service.release_account(account["name"], True, task_type="chat")
             return text
         except asyncio.CancelledError:
-            gemini_account_service.release_account(account["name"], False, "request cancelled", task_type="chat")
+            logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
+                           request_id, attempt, account_ref, proxy_ref)
+            gemini_account_service.release_account(account["name"], False, task_type="chat")
             raise
         except Exception as exc:
+            logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s reason=%s status=%s",
+                         request_id, attempt, account_ref, proxy_ref, type(exc).__name__, getattr(exc, "status_code", None))
             # 本次连接已由 GeminiBackendAPI 单独回收，其他并发请求继续执行。
             gemini_account_service.release_account(
                 account["name"], False, str(exc), status_code=getattr(exc, "status_code", None),
-                task_type="chat",
+                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account",
             )
             raise
     elif resolved.platform == "doubao":
-        account = await asyncio.to_thread(doubao_account_service.wait_for_available_account, "chat")
+        account = await doubao_account_service.acquire_account("chat")
+        account_ref = stable_log_ref("doubao-account", account.get("name"))
+        proxy_ref = proxy_log_ref(account)
+        logger.info("event=upstream_attempt_started request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s",
+                    request_id, attempt, account_ref, proxy_ref)
         try:
-            async with DoubaoBackendAPI(account["cookies"], account.get("proxy", "")) as backend:
+            async with DoubaoBackendAPI(account["cookies"], account.get("proxy", ""), account.get("device_id"), account.get("web_id"), account.get("fp")) as backend:
                 attachments = [await backend.upload_image(url) for url in images]
                 text = await backend.chat(prompt, attachments)
+            logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s",
+                        request_id, attempt, account_ref, proxy_ref)
             doubao_account_service.release_account(account["name"], True, task_type="chat")
             return text
         except asyncio.CancelledError:
-            doubao_account_service.release_account(account["name"], False, "request cancelled", task_type="chat")
+            logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s",
+                           request_id, attempt, account_ref, proxy_ref)
+            doubao_account_service.release_account(account["name"], False, task_type="chat")
             raise
         except Exception as exc:
+            logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s reason=%s status=%s",
+                         request_id, attempt, account_ref, proxy_ref, type(exc).__name__, getattr(exc, "status_code", None))
             doubao_account_service.release_account(
                 account["name"], False, str(exc), status_code=getattr(exc, "status_code", None),
-                task_type="chat",
+                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account",
             )
             raise
     else:
-        account = await asyncio.to_thread(account_service.wait_for_available_account, "chat")
+        account = await account_service.acquire_account("chat")
+        account_ref = stable_log_ref("gpt-account", account.get("email"))
+        proxy_ref = proxy_log_ref(account)
+        logger.info("event=upstream_attempt_started request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
+                    request_id, attempt, account_ref, proxy_ref)
         try:
             def run() -> str:
-                with OpenAIBackendAPI(account["access_token"], account.get("proxy", "")) as backend:
-                    return backend.chat_text(prompt, images, resolved.model)
-            text = await asyncio.to_thread(run)
-            account_service.release_account(account["email"], True, task_type="chat")
+                try:
+                    with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", "")) as backend:
+                        text = backend.chat_text(prompt, images, resolved.model)
+                except Exception as exc:
+                    status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
+                    account_service.release_account(account["email"], False, str(exc), status_code=status,
+                                                    task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account")
+                    raise
+                account_service.release_account(account["email"], True, task_type="chat")
+                return text
+
+            text = await await_thread_result(run)
+            logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
+                        request_id, attempt, account_ref, proxy_ref)
             return text
         except asyncio.CancelledError:
-            account_service.release_account(account["email"], False, "request cancelled", task_type="chat")
+            logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
+                           request_id, attempt, account_ref, proxy_ref)
             raise
         except Exception as exc:
-            status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
-            account_service.release_account(account["email"], False, str(exc), status_code=status, task_type="chat")
+            logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s reason=%s status=%s",
+                         request_id, attempt, account_ref, proxy_ref, type(exc).__name__, getattr(exc, "status_code", None))
             raise
 
 
@@ -143,13 +181,20 @@ async def chat_completions(body: ChatCompletionRequest):
     """
     resolved = resolve_model(body.model, "chat")
     prompt = apply_analysis_constraint(body.prompt)
+    request_id = body.request_id or uuid.uuid4().hex
+    started_at = time.monotonic()
+    logger.info(
+        "event=chat_request_started request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s model=%s images=%d",
+        request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+        body.stage, resolved.platform, resolved.model, len(body.images),
+    )
 
     # 包含首次调用与 1 次异常就地重试，最大尝试 2 次
     max_attempts = 2
 
     for attempt in range(max_attempts):
         try:
-            text = await _execute_chat_once(resolved, prompt, body.images)
+            text = await _execute_chat_once(resolved, prompt, body.images, request_id, attempt + 1)
 
             # 校验文本是否命中字数异常
             if is_anomalous_text(text):
@@ -160,27 +205,50 @@ async def chat_completions(body: ChatCompletionRequest):
                 )
                 if attempt < max_attempts - 1:
                     logger.warning(
-                        f"[Chat Anomaly] {anomaly_detail}，触发代理侧自动就地重试 (第 {attempt + 1}/{max_attempts - 1} 次)... "
-                        f"原输出片段: {text.strip()[:60]!r}"
+                        "event=chat_attempt_anomalous request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s attempt=%d max_attempts=%d output_chars=%d",
+                        request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+                        body.stage, attempt + 1, max_attempts, text_len,
                     )
                     await asyncio.sleep(1)
                     continue
                 else:
-                    logger.error(f"[Chat Anomaly] {anomaly_detail}，已达到最大重试次数，向客户端返回错误")
+                    logger.error(
+                        "event=chat_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s attempt=%d max_attempts=%d elapsed_ms=%d reason=anomalous_output output_chars=%d",
+                        request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+                        body.stage, attempt + 1, max_attempts, int((time.monotonic() - started_at) * 1000), text_len,
+                    )
                     raise HTTPException(
                         status_code=502,
-                        detail=f"{resolved.platform} chat output anomaly: {anomaly_detail}"
+                        detail=f"{resolved.platform} chat output anomaly: {anomaly_detail}",
+                        headers={"X-Request-ID": request_id},
                     )
 
             # 正常合规文本或合法 JSON，直接成功返回
-            return {"code": 0, "model": body.model, "text": text, "created": int(time.time())}
+            logger.info(
+                "event=chat_request_succeeded request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s attempt=%d elapsed_ms=%d output_chars=%d",
+                request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+                body.stage, attempt + 1, int((time.monotonic() - started_at) * 1000), len(text),
+            )
+            return JSONResponse(
+                content={"code": 0, "model": body.model, "text": text, "created": int(time.time())},
+                headers={"X-Request-ID": request_id},
+            )
         except HTTPException:
             raise
         except Exception as exc:
             if attempt < max_attempts - 1:
                 logger.warning(
-                    f"[Chat Retry] 调用 {resolved.platform} 发生网络/接口异常: {exc}，将在 1 秒后自动进行第 {attempt + 1} 次就地重试..."
+                    "event=chat_attempt_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s attempt=%d max_attempts=%d reason=%s",
+                    request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+                    body.stage, resolved.platform, attempt + 1, max_attempts, type(exc).__name__,
                 )
                 await asyncio.sleep(1)
                 continue
-            raise HTTPException(status_code=502, detail=f"{resolved.platform} chat failed: {exc}") from exc
+            logger.error(
+                "event=chat_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s attempt=%d max_attempts=%d elapsed_ms=%d reason=%s",
+                request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
+                body.stage, resolved.platform, attempt + 1, max_attempts,
+                int((time.monotonic() - started_at) * 1000), type(exc).__name__,
+            )
+            raise HTTPException(status_code=502, detail=f"{resolved.platform} chat failed: {exc}",
+                                headers={"X-Request-ID": request_id}) from exc

@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 from core.account_pool import BaseAccountPool
+from providers.doubao.backend import DoubaoBackendAPI
 from utils.helper import parse_cookie_string
 
 
@@ -17,8 +18,19 @@ class DoubaoAccountPool(BaseAccountPool):
 
     def __init__(self) -> None:
         super().__init__(platform="doubao")
+        for name, account in self._accounts.items():
+            self._ensure_identity(account)
+            self._save(name)
 
-    def add_account(self, name: str, cookie: str, proxy: str = "") -> dict[str, Any]:
+    @staticmethod
+    def _ensure_identity(account: dict[str, Any]) -> None:
+        """首次载入时固定旧账号设备标识，Cookie 更新后仍复用原标识。"""
+        backend = DoubaoBackendAPI(account["cookies"], account.get("proxy", ""))
+        account.setdefault("device_id", backend.device_id)
+        account.setdefault("web_id", backend.web_id)
+        account.setdefault("fp", backend.fp)
+
+    def add_account(self, name: str, cookie: str, proxy: str = "", proxy_id: int | None = None) -> dict[str, Any]:
         cookies = parse_cookie_string(cookie)
         if not cookies.get("sessionid"):
             raise ValueError("Cookie 中缺少 sessionid")
@@ -26,6 +38,8 @@ class DoubaoAccountPool(BaseAccountPool):
             "name": name.strip() or f"doubao-{int(time.time())}",
             "cookies": cookies,
             "proxy": proxy.strip(),
+            "proxy_id": proxy_id,
+            "proxy_status": "active" if proxy_id else None,
             "status": "active",
             "inflight": 0,
             "cooldown_until": 0,
@@ -33,7 +47,11 @@ class DoubaoAccountPool(BaseAccountPool):
             "last_used_at": 0,
             "error_message": "",
         }
+        self._ensure_identity(account)
         with self._condition:
+            previous = self._accounts.get(account["name"], {})
+            for field in ("device_id", "web_id", "fp"):
+                account[field] = previous.get(field, account[field])
             self._accounts[account["name"]] = account
             self._save(account["name"])
             self._condition.notify_all()

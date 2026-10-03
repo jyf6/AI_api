@@ -44,20 +44,20 @@ class ChatRequirements:
 class OpenAIBackendAPI:
     """ChatGPT reverse client with per-account proxy binding and zero-storage image output."""
 
-    def __init__(self, access_token: str = "", proxy: str = "") -> None:
+    def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "") -> None:
         self.access_token = access_token.strip()
         self.proxy = proxy.strip()
         self.base_url = "https://chatgpt.com"
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
-        self.device_id = str(uuid.uuid4())
+        self.device_id = device_id or str(uuid.uuid4())
         self.session_id = str(uuid.uuid4())
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/145.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         )
-        self.sec_ch_ua = '"Chromium";v="145", "Not:A-Brand";v="99"'
+        self.sec_ch_ua = '"Chromium";v="124", "Not:A-Brand";v="99"'
 
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
         self.session = requests.Session(impersonate="chrome124", proxies=proxies)

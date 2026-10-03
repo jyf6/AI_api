@@ -1,0 +1,19 @@
+[Unit]
+Description=ChatGPT Image Python Service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/app/chatgpt2api/current
+EnvironmentFile=/etc/flexi/chatgpt2api.env
+ExecStart=/opt/app/chatgpt2api/current/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8010 --access-log
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

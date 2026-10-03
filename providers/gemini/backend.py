@@ -144,6 +144,31 @@ def _create_temp_image_files(sources: list[str]):
                 pass
 
 
+@contextlib.asynccontextmanager
+async def _prepare_temp_image_files(sources: list[str]):
+    """在线程中准备参考图；取消等待后仍清理已创建的临时文件。"""
+    files = _create_temp_image_files(sources)
+    preparation = asyncio.create_task(asyncio.to_thread(files.__enter__))
+    try:
+        temp_paths = await asyncio.shield(preparation)
+    except asyncio.CancelledError:
+        # 线程不会随请求取消而停止，完成后清理由它创建的文件。
+        def cleanup(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except Exception:
+                return
+            asyncio.create_task(asyncio.to_thread(files.__exit__, None, None, None))
+
+        preparation.add_done_callback(cleanup)
+        raise
+    try:
+        yield temp_paths
+    finally:
+        # 即使调用上游期间取消请求，清理线程仍会完成。
+        await asyncio.shield(asyncio.to_thread(files.__exit__, None, None, None))
+
+
 class GeminiBackendAPI:
     """Gemini Web reverse client; no browser process and no persistent image files."""
 
@@ -180,7 +205,7 @@ class GeminiBackendAPI:
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
         client_model = None if model == "auto" else model
-        with _create_temp_image_files(image_sources) as temp_files:
+        async with _prepare_temp_image_files(image_sources) as temp_files:
             stream = self.client.generate_content_stream(prompt, files=temp_files or None, model=client_model)
             text = ""
             try:
@@ -229,7 +254,7 @@ class GeminiBackendAPI:
         _configure_image_aspect_ratio(self.client, aspect_ratio)
         client_model = None if model == "auto" else model
         try:
-            with _create_temp_image_files(references or []) as temp_files:
+            async with _prepare_temp_image_files(references or []) as temp_files:
                 stream = self.client.generate_content_stream(
                     prompt, files=temp_files or None, model=client_model
                 )

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import urllib.request
 
 import hashlib
@@ -10,20 +11,51 @@ import aiohttp
 from utils.image_binary import image_media_type
 
 
+def _prepare_reference_image(image_data: str) -> tuple[bytes, str]:
+    """在线程中完成参考图下载和压缩，避免阻塞代理事件循环。"""
+    with urllib.request.urlopen(image_data, timeout=30) as response:
+        image_bytes = response.read()
+    # 大图压缩同样属于同步工作，必须与下载一起移出事件循环。
+    if len(image_bytes) > 4 * 1024 * 1024:
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(image_bytes))
+            max_dim = max(img.width, img.height)
+            if max_dim > 2048:
+                scale = 2048.0 / max_dim
+                new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            image_bytes = buf.getvalue()
+        except Exception:
+            # 压缩失败沿用原图，保持原有上传行为。
+            pass
+
+    content_type = image_media_type(image_bytes)
+    if content_type is None:
+        raise RuntimeError("Doubao reference download did not return a valid image")
+    return image_bytes, content_type
+
+
 class DoubaoBackendAPI:
     BASE_URL = "https://www.doubao.com"
     DEFAULT_CHROMIUM_VERSION = "135.0.0.0"
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
-    def __init__(self, cookies: dict[str, str], proxy: str = "") -> None:
+    def __init__(self, cookies: dict[str, str], proxy: str = "", device_id: str = "", web_id: str = "", fp: str = "") -> None:
         if not cookies:
             raise ValueError("Doubao cookies are required")
         self.cookies = cookies
         self.proxy = proxy or None
         self.session: aiohttp.ClientSession | None = None
         # 账号专有设备指纹初始化（消除全局硬编码，实现多账号设备隔离）
-        self.device_id = self._init_device_id()
-        self.web_id = self._init_web_id()
-        self.fp = self._init_fp()
+        self.device_id = device_id or self._init_device_id()
+        self.web_id = web_id or self._init_web_id()
+        self.fp = fp or self._init_fp()
 
     def _init_device_id(self) -> str:
         """优先使用 Cookie 中的 device_id；若缺失，则基于账号 sessionid/uid 生成专属唯一的 19 位设备 ID，隔离多账号风控。"""
@@ -54,7 +86,7 @@ class DoubaoBackendAPI:
     async def __aenter__(self):
         connector = self._build_connector()
         self.session = aiohttp.ClientSession(cookies=self.cookies, connector=connector,
-            headers={"User-Agent": "Mozilla/5.0 Chrome/145.0.0.0 Safari/537.36", "Origin": self.BASE_URL,
+            headers={"User-Agent": self.USER_AGENT, "Origin": self.BASE_URL,
                      "Referer": self.BASE_URL + "/chat", "Content-Type": "application/json"})
         return self
 
@@ -102,37 +134,14 @@ class DoubaoBackendAPI:
     async def upload_image(self, image_data: str, filename: str = "image.png") -> dict[str, str]:
         if not self.session:
             raise RuntimeError("Doubao client is not initialized")
-        image_bytes = urllib.request.urlopen(image_data, timeout=30).read()
-        # 针对超大图片（体积 > 4MB 或长边 > 2048px）进行内存高质量缩放压缩，彻底避免豆包网关抛出 502 Bad Gateway
-        if len(image_bytes) > 4 * 1024 * 1024:
-            try:
-                import io
-                from PIL import Image
-                img = Image.open(io.BytesIO(image_bytes))
-                max_dim = max(img.width, img.height)
-                if max_dim > 2048:
-                    scale = 2048.0 / max_dim
-                    new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-                    img = img.resize(new_size, Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                img.save(buf, format="JPEG", quality=85, optimize=True)
-                image_bytes = buf.getvalue()
-            except Exception:
-                # 压缩异常时静默回退使用原图
-                pass
-
-        content_type = image_media_type(image_bytes)
-        if content_type is None:
-            raise RuntimeError("Doubao reference download did not return a valid image")
+        image_bytes, content_type = await asyncio.to_thread(_prepare_reference_image, image_data)
         ext = content_type.removeprefix("image/")
         actual_filename = f"image.{ext}"
 
         form = aiohttp.FormData()
         form.add_field("data", image_bytes, filename=actual_filename, content_type=content_type)
         form.add_field("file_type", ext)
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/135.0.0.0 Safari/537.36",
+        headers = {"User-Agent": self.USER_AGENT,
                    "Origin": self.BASE_URL, "Referer": self.BASE_URL + "/chat",
                    "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
         upload_timeout = aiohttp.ClientTimeout(total=60)
