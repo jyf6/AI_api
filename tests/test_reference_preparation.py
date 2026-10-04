@@ -1,7 +1,7 @@
-"""参考图准备不能占用代理事件循环，取消后仍需清理临时文件。"""
+"""参考图准备不能占用代理事件循环，取消后仍需释放内存。"""
 
 import asyncio
-import tempfile
+import contextlib
 import threading
 
 import pytest
@@ -39,28 +39,31 @@ def test_doubao_reference_download_does_not_block_event_loop(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_gemini_cancelled_preparation_cleans_temp_files(monkeypatch, tmp_path):
+def test_gemini_cancelled_preparation_closes_memory_images(monkeypatch, tmp_path):
     started = threading.Event()
     release = threading.Event()
-    file_created = threading.Event()
-    original = tempfile.NamedTemporaryFile
+    image_created = threading.Event()
+    images = []
+    original = gemini._create_reference_images
 
     def slow_read(_source):
         started.set()
         release.wait(1)
         return b"image", ".png"
 
-    def local_temp_file(**kwargs):
-        result = original(dir=tmp_path, **kwargs)
-        file_created.set()
-        return result
+    @contextlib.contextmanager
+    def track_images(sources):
+        with original(sources) as prepared:
+            images.extend(prepared)
+            image_created.set()
+            yield prepared
 
     monkeypatch.setattr(gemini, "_read_image_source", slow_read)
-    monkeypatch.setattr(gemini.tempfile, "NamedTemporaryFile", local_temp_file)
+    monkeypatch.setattr(gemini, "_create_reference_images", track_images)
 
     async def scenario():
         async def prepare():
-            async with gemini._prepare_temp_image_files(["https://example.invalid/image"]):
+            async with gemini._prepare_reference_images(["https://example.invalid/image"]):
                 pass
 
         request = asyncio.create_task(prepare())
@@ -70,11 +73,12 @@ def test_gemini_cancelled_preparation_cleans_temp_files(monkeypatch, tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await request
         release.set()
-        assert await asyncio.to_thread(file_created.wait, 1)
+        assert await asyncio.to_thread(image_created.wait, 1)
         for _ in range(100):
-            if not list(tmp_path.iterdir()):
+            if images and images[0].closed:
+                assert not list(tmp_path.iterdir())
                 return
             await asyncio.sleep(0.01)
-        assert not list(tmp_path.iterdir())
+        assert images[0].closed
 
     asyncio.run(scenario())

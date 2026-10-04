@@ -1,9 +1,6 @@
 import re
-import time
-from pathlib import Path
 from typing import NamedTuple
 
-import orjson as json
 from curl_cffi import CurlFollow, CurlHttpVersion
 from curl_cffi.curl import CurlError
 from curl_cffi.requests import AsyncSession, BrowserTypeLiteral, Cookies, Response
@@ -26,13 +23,7 @@ from providers.gemini.webapi.exceptions import (
     TimeoutError as GeminiTimeoutError,
 )
 
-from .load_browser_cookies import HAS_BC3, load_browser_cookies
 from .logger import logger
-from .rotate_1psidts import (
-    _extract_cookie_value,
-    _get_cookie_cache_dir,
-    _get_cookies_cache_path,
-)
 
 
 class InitSession(NamedTuple):
@@ -53,8 +44,8 @@ class InitSession(NamedTuple):
     client: `curl_cffi.requests.AsyncSession`
         The **live** session that succeeded, so the caller can reuse its TLS connection.
     cookie_source: `str`
-        Name of the cookie group that produced this session - "Cache", "Base Cookies",
-        "Browser (firefox)", "Guest". A session is accepted as soon as it yields an access
+        Name of the cookie group that produced this session - "Base Cookies" or "Guest".
+        A session is accepted as soon as it yields an access
         token, which an unauthenticated one does too, so the caller needs to know which
         group to blame when the session turns out to be unusable.
 
@@ -112,59 +103,10 @@ def _to_jar(base_cookies: dict | Cookies) -> Cookies:
     return jar
 
 
-def _load_cached_jar(
-    cache_file: Path, jar: Cookies | None = None, verbose: bool = False
-) -> Cookies | None:
-    """Load non-expired cookies from a cache file, layered on top of `jar` if provided.
-
-    Returns `None` if the cache file is unusable, so the caller can fall back to other sources.
-    """
-    try:
-        content = cache_file.read_text().strip()
-    except OSError as e:
-        logger.warning(f"Failed to read cached cookies: {e}")
-        return None
-
-    if not content:
-        if verbose:
-            logger.debug("Skipping loading cached cookies. Cache file is empty.")
-        return None
-
-    try:
-        cookies_data = json.loads(content)
-    except Exception as e:
-        logger.warning(f"Failed to parse cached cookies as JSON: {e}")
-        return None
-
-    if not isinstance(cookies_data, list):
-        logger.warning("Failed to load cached cookies: unexpected cache file format.")
-        return None
-
-    result = Cookies(jar) if jar is not None else Cookies()
-    for cookie in cookies_data:
-        name, value = cookie.get("name"), cookie.get("value")
-        if not name or not value:
-            continue
-
-        expires = cookie.get("expires")
-        if expires and expires < time.time():
-            continue
-
-        result.set(
-            name,
-            value,
-            domain=cookie.get("domain", _COOKIE_DOMAIN),
-            path=cookie.get("path", _COOKIE_PATH),
-            secure=True,
-        )
-
-    return result
-
-
 def _fill_missing(jar: Cookies, extra: Cookies) -> Cookies:
     """Complete `jar` with cookies from `extra` that it doesn't already carry.
 
-    Values already present in `jar` always win, so cached or user provided cookies
+    Values already present in `jar` always win, so supplied cookies
     never get overwritten by freshly issued anonymous ones.
     """
     merged = Cookies(jar)
@@ -233,11 +175,8 @@ async def get_access_token(
     """Send a get request to gemini.google.com for each group of available cookies and return
     the value of "SNlM0e" as access token on the first successful request.
 
-    Cookie groups are tried offline first, in order of freshness: cached cookies, then user
-    provided cookies, then local browser cookies. Only if all of them fail does the client
-    fall back to a preflight request against google.com to pick up consent/anonymous cookies,
-    which are then used to complete the previous groups (without ever overwriting their
-    values) and, as a last resort, to attempt a guest session.
+    Supplied cookies are tried first. If they fail, a preflight request against google.com
+    picks up consent/anonymous cookies to complete them, then attempts a guest session.
 
     Returns the **live** AsyncSession that succeeded so the caller can reuse the same TLS
     connection for subsequent requests, along with the name of the cookie group it came
@@ -285,101 +224,11 @@ async def get_access_token(
     )
 
     try:
-        # Phase 1: Collect candidate cookie groups offline, no network access involved
-        cookie_jars_to_test: list[tuple[Cookies, str]] = []
-        tried_sessions: dict[str, set[str]] = {}
-
+        # The account database supplies the last verified cookies.
         base_jar = _to_jar(base_cookies)
-        base_psid = _extract_cookie_value(base_jar, "__Secure-1PSID")
-        base_psidts = _extract_cookie_value(base_jar, "__Secure-1PSIDTS")
-
-        def register(jar: Cookies, group_name: str, psid: str | None) -> None:
-            cookie_jars_to_test.append((jar, group_name))
-            if psid:
-                psidts = _extract_cookie_value(jar, "__Secure-1PSIDTS") or ""
-                tried_sessions.setdefault(psid, set()).add(psidts)
-
-        # Cached cookies come first: they hold the most recently rotated __Secure-1PSIDTS
-        if base_psid:
-            probe = Cookies()
-            probe.set("__Secure-1PSID", base_psid, domain=_COOKIE_DOMAIN, secure=True)
-            cache_file = _get_cookies_cache_path(probe)
-
-            if cache_file and cache_file.is_file():
-                if (jar := _load_cached_jar(cache_file, base_jar, verbose)) is not None:
-                    register(jar, "Cache", base_psid)
-            elif verbose:
-                logger.debug("Skipping loading cached cookies. Cache file not found.")
-        elif cache_files := list(_get_cookie_cache_dir().glob(".cached_cookies_*.json")):
-            cache_file = max(cache_files, key=lambda p: p.stat().st_mtime)
-            if (jar := _load_cached_jar(cache_file, verbose=verbose)) is not None:
-                register(jar, "Cache (Latest)", cache_file.stem[16:])
-
-        # User provided cookies, skipped if the cache already covers the same session
-        if base_psid:
-            if (base_psidts or "") not in tried_sessions.get(base_psid, set()):
-                register(Cookies(base_jar), "Base Cookies", base_psid)
-            elif verbose:
-                logger.debug("Skipping base cookies as they match cached cookies.")
-        elif verbose and not cookie_jars_to_test:
-            logger.debug("Skipping loading base cookies. __Secure-1PSID is not provided.")
-
-        # Local browser cookies as the last authenticated source
-        try:
-            if browser_cookies := load_browser_cookies(domain_name=_DOMAIN_NAME, verbose=verbose):
-                for browser, cookie_list in browser_cookies.items():
-                    temp_cookies = {c["name"]: c["value"] for c in cookie_list}
-                    secure_1psid = temp_cookies.get("__Secure-1PSID")
-                    secure_1psidts = temp_cookies.get("__Secure-1PSIDTS", "")
-
-                    if not secure_1psid:
-                        continue
-
-                    if base_psid and base_psid != secure_1psid:
-                        if verbose:
-                            logger.debug(
-                                f"Skipping loading local browser cookies from {browser}. "
-                                "__Secure-1PSID does not match the one provided."
-                            )
-                        continue
-
-                    if secure_1psidts in tried_sessions.get(secure_1psid, set()):
-                        continue
-
-                    jar = Cookies()
-                    for cookie in cookie_list:
-                        # Load only __Secure-1PSID and __Secure-1PSIDTS to prevent HTTP 401 errors when rotating cookies.
-                        if cookie["name"] not in [
-                            "__Secure-1PSID",
-                            "__Secure-1PSIDTS",
-                        ]:
-                            continue
-
-                        jar.set(
-                            cookie["name"],
-                            cookie["value"],
-                            domain=cookie["domain"],
-                            path=cookie["path"],
-                            secure=True,
-                        )
-
-                    register(jar, f"Browser ({browser})", secure_1psid)
-                    if verbose:
-                        logger.debug(f"Prepared essential browser cookies from {browser}.")
-
-            if (
-                HAS_BC3
-                and not any(group.startswith("Browser") for _, group in cookie_jars_to_test)
-                and verbose
-            ):
-                logger.debug(
-                    "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
-                )
-        except Exception:
-            if verbose:
-                logger.debug(
-                    "Skipping loading local browser cookies (Not available or no permission)."
-                )
+        cookie_jars_to_test: list[tuple[Cookies, str]] = (
+            [(base_jar, "Base Cookies")] if len(base_jar.jar) else []
+        )
 
         # Phase 2: Try every candidate group as-is, without contacting google.com first
         attempts = 0

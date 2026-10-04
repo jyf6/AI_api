@@ -23,12 +23,12 @@
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填写 DB_PASSWORD 和实际的 MySQL 连接参数
-# 在目标数据库执行 init_database_schema.sql
-docker compose up -d --build
+# 编辑 .env，填写与 Java 服务相同的 OSS_ACCESS_ID、OSS_ACCESS_KEY、OSS_ENDPOINT、OSS_BUCKET
+# MySQL、Redis 使用 flexi-scheduler-shared 网络中的 mysql、redis 服务
+docker compose up -d --build app
 ```
 
-唯一的部署入口是 `docker-compose.yml`。MySQL 需要先运行，默认从容器通过 `host.docker.internal:3306` 连接宿主机的 `flexi_admin` 数据库；实际地址、库名和账号可在 `.env` 中修改。服务默认只监听宿主机 `127.0.0.1:8010`，需要其他机器访问时修改 Compose 的端口绑定。
+Docker 部署使用 `docker-compose.yml`；先启动共享网络中的 MySQL、Redis，并由 Java Flyway 建表。Python 从环境变量读取数据库、Redis 和 OSS 配置；参考图参数为当前 OSS bucket 的 objectKey。抠图模型缓存保存在 Docker 卷中，首次调用抠图接口时才加载。服务默认只监听宿主机 `127.0.0.1:8010`。
 
 启动后可访问 `http://localhost:8010/`；生图接口为 `POST /v1/images/generations`，健康检查为 `GET /health`。
 

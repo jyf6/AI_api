@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +19,11 @@ class Database:
         self.path = path  # 保留参数以兼容旧脚本，SQLite 不再使用。
 
     def _connect(self):
-        return pymysql.connect(host="127.0.0.1", port=3306,
-                               user="root", password="123456",
-                               database="flexi_admin", charset="utf8mb4",
+        return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+                               port=int(os.getenv("MYSQL_PORT", "3306")),
+                               user=os.getenv("MYSQL_USER", "root"),
+                               password=os.getenv("MYSQL_PASSWORD", "123456"),
+                               database=os.getenv("MYSQL_DATABASE", "flexi_admin"), charset="utf8mb4",
                                cursorclass=DictCursor, autocommit=True)
 
     def get_enabled_user(self, user_id: int) -> dict[str, Any] | None:

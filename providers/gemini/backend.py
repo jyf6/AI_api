@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
+import io
 import json
-from pathlib import Path
-import tempfile
 from typing import Any
-import urllib.request
+
 
 from curl_cffi.requests import AsyncSession
 
 from utils.log import logger
 from utils.image_binary import image_media_type
+from utils.oss_reference import read_oss_reference
 
 
 def _inject_aspect_ratio(request_data: dict[str, Any], aspect_ratio: str) -> dict[str, Any]:
@@ -93,28 +92,8 @@ def _detect_image_suffix(data: bytes) -> str:
 
 
 def _read_image_source(source: str) -> tuple[bytes, str]:
-    """Read image bytes from data-url or http-url and determine file extension."""
-    if source.startswith("data:"):
-        header_part, data_part = source.split(",", 1)
-        raw = base64.b64decode(data_part)
-        header_lower = header_part.lower()
-        if "image/jpeg" in header_lower or "image/jpg" in header_lower:
-            ext = ".jpg"
-        elif "image/webp" in header_lower:
-            ext = ".webp"
-        elif "image/gif" in header_lower:
-            ext = ".gif"
-        elif "image/png" in header_lower:
-            ext = ".png"
-        else:
-            ext = _detect_image_suffix(raw[:16])
-        if image_media_type(raw) is None:
-            raise RuntimeError("Gemini reference download did not return a valid image")
-        return raw, ext
-
-    req = urllib.request.Request(source, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read()
+    """使用统一的 OSS objectKey 读取私有参考图。"""
+    raw = read_oss_reference(source)
     if image_media_type(raw) is None:
         raise RuntimeError("Gemini reference download did not return a valid image")
     ext = _detect_image_suffix(raw[:16])
@@ -122,37 +101,32 @@ def _read_image_source(source: str) -> tuple[bytes, str]:
 
 
 @contextlib.contextmanager
-def _create_temp_image_files(sources: list[str]):
-    """Write input image sources to temp files with valid image extensions so gemini_webapi can upload them properly."""
-    temp_paths: list[Path] = []
+def _create_reference_images(sources: list[str]):
+    """Keep reference images in memory with names that preserve their media types."""
+    images: list[io.BytesIO] = []
     try:
         for src in sources:
             if not src:
                 continue
             raw_bytes, ext = _read_image_source(str(src))
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-            tf.write(raw_bytes)
-            tf.flush()
-            tf.close()
-            temp_paths.append(Path(tf.name))
-        yield temp_paths
+            image = io.BytesIO(raw_bytes)
+            image.name = f"reference_{len(images) + 1}{ext}"
+            images.append(image)
+        yield images
     finally:
-        for p in temp_paths:
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                pass
+        for image in images:
+            image.close()
 
 
 @contextlib.asynccontextmanager
-async def _prepare_temp_image_files(sources: list[str]):
-    """在线程中准备参考图；取消等待后仍清理已创建的临时文件。"""
-    files = _create_temp_image_files(sources)
+async def _prepare_reference_images(sources: list[str]):
+    """在线程中读取参考图；取消等待后仍释放已读取的内存。"""
+    files = _create_reference_images(sources)
     preparation = asyncio.create_task(asyncio.to_thread(files.__enter__))
     try:
-        temp_paths = await asyncio.shield(preparation)
+        images = await asyncio.shield(preparation)
     except asyncio.CancelledError:
-        # 线程不会随请求取消而停止，完成后清理由它创建的文件。
+        # 线程不会随请求取消而停止，完成后关闭它创建的内存对象。
         def cleanup(done: asyncio.Task) -> None:
             try:
                 done.result()
@@ -163,7 +137,7 @@ async def _prepare_temp_image_files(sources: list[str]):
         preparation.add_done_callback(cleanup)
         raise
     try:
-        yield temp_paths
+        yield images
     finally:
         # 即使调用上游期间取消请求，清理线程仍会完成。
         await asyncio.shield(asyncio.to_thread(files.__exit__, None, None, None))
@@ -205,14 +179,14 @@ class GeminiBackendAPI:
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
         client_model = None if model == "auto" else model
-        async with _prepare_temp_image_files(image_sources) as temp_files:
-            stream = self.client.generate_content_stream(prompt, files=temp_files or None, model=client_model)
+        async with _prepare_reference_images(image_sources) as images:
+            stream = self.client.generate_content_stream(prompt, files=images or None, model=client_model)
             text = ""
             try:
                 while True:
-                    # 首段文本最多等待 20 秒；已有文本后，空闲 5 秒即使用现有结果返回。
+                    # 首段文本最多等待 20 秒；已有文本后，空闲 6 秒即使用现有结果返回。
                     try:
-                        output = await asyncio.wait_for(anext(stream), timeout=5 if text else 20)
+                        output = await asyncio.wait_for(anext(stream), timeout=6 if text else 20)
                     except TimeoutError:
                         if text:
                             return text.strip()
@@ -254,9 +228,9 @@ class GeminiBackendAPI:
         _configure_image_aspect_ratio(self.client, aspect_ratio)
         client_model = None if model == "auto" else model
         try:
-            async with _prepare_temp_image_files(references or []) as temp_files:
+            async with _prepare_reference_images(references or []) as images:
                 stream = self.client.generate_content_stream(
-                    prompt, files=temp_files or None, model=client_model
+                    prompt, files=images or None, model=client_model
                 )
                 try:
                     async for output in stream:

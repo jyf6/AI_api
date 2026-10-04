@@ -71,7 +71,6 @@ from .types import (
 )
 from .utils import (
     StreamingFrameParser,
-    clear_cookies_cache,
     extract_citations,
     extract_deep_research_document,
     extract_deep_research_plan,
@@ -84,7 +83,6 @@ from .utils import (
     parse_file_name,
     rotate_1psidts,
     running,
-    save_cookies,
     upload_file,
 )
 
@@ -92,8 +90,7 @@ from .utils import (
 class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
     """Async requests client interface for gemini.google.com.
 
-    `secure_1psid` must be provided unless the optional dependency `browser-cookie3` is installed, and
-    you have logged in to google.com in your local browser.
+    `secure_1psid` must be provided by the account service.
 
     Parameters
     ----------
@@ -106,11 +103,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
     kwargs: `dict`, optional
         Additional arguments which will be passed to the http client.
         Refer to `curl_cffi.requests.AsyncSession` for more information.
-
-    Raises
-    ------
-    `ValueError`
-        If `browser-cookie3` is installed but cookies for google.com are not found in your local browser storage.
 
     """
 
@@ -141,7 +133,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         "language",
         "last_activity_time",
         "on_cookie_refreshed",
-        "persist_cookie_cache",
         "proxy",
         "push_id",
         "refresh_interval",
@@ -185,8 +176,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         self.on_cookie_refreshed: Callable[["GeminiClient"], Any] | None = kwargs.pop(
             "on_cookie_refreshed", None
         )
-        # 请求专用客户端不能把旧 Cookie 写回账号级缓存；续期缓存只由常驻客户端维护。
-        self.persist_cookie_cache: bool = kwargs.pop("persist_cookie_cache", True)
         self._running: bool = False
         self._cookies = Cookies()
         self._cookie_source: str = ""
@@ -359,7 +348,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 raise
 
     async def close(self, delay: float = 0) -> None:
-        """Close the client and save cookies.
+        """Close the client.
 
         Parameters
         ----------
@@ -375,7 +364,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 f"triggered client closing."
             )
 
-        was_running = self._running
         self._running = False
 
         if self.close_task:
@@ -395,23 +383,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
             await self.client.close()
             self.client = None
 
-        # Only save cookies if the client was running and successfully initialized.
-        # When init() fails (e.g. network/DNS error), self._cookies only contains uninitialized
-        # or initial base cookies, which must never overwrite existing valid cache files.
-        if not was_running or not self.persist_cookie_cache:
-            return
-
-        # Cached cookies are tried ahead of the ones the caller supplies, so caching an
-        # unauthenticated session would restore an entry just cleared as stale, or create
-        # the very entry that shadows real credentials on the next run.
-        if self.account_status == AccountStatus.UNAUTHENTICATED:
-            logger.debug("Skipping cookie cache write: the session is not authenticated.")
-            return
-
-        try:
-            save_cookies(self._cookies, self.verbose)
-        except OSError as e:
-            logger.warning(f"Failed to save cookies to cache file: {e}")
 
     async def reset_close_task(self) -> None:
         """Reset the timer for closing the client when a new request is made."""
@@ -575,20 +546,6 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 logger.warning(
                     f"Account status: {self.account_status.name} - {self.account_status.description}"
                 )
-                if (
-                    self.account_status == AccountStatus.UNAUTHENTICATED
-                    and self._cookie_source.startswith("Cache")
-                ):
-                    # A stale cache entry would shadow working credentials on every later
-                    # run, since cached cookies are tried first and are accepted as soon as
-                    # they yield a token - which an unauthenticated session also does. Only
-                    # the cache is dropped, and only when it produced this session: it also
-                    # holds rotated cookies, often the freshest credentials the client has.
-                    logger.debug(
-                        "Cached cookies produced an unauthenticated session; clearing them "
-                        "so the next attempt can fall through to the supplied credentials."
-                    )
-                    clear_cookies_cache(self.cookies, self.verbose)
                 if self.account_status in [
                     AccountStatus.LOCATION_REJECTED,
                     AccountStatus.ACCOUNT_REJECTED,
@@ -1389,7 +1346,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     if isinstance(file, io.BytesIO):
                         file.close()
 
-    @running(retry=5)
+    @running()
     async def _generate(
         self,
         prompt: str,
@@ -1915,8 +1872,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                             # persisted, but not a necessary one: a capability refusal (e.g.
                             # video generation on an ineligible plan) ends the stream with a
                             # complete answer already in the conversation and no marker, and
-                            # refusing to recover there made `@running(retry=5)` re-send the
-                            # prompt six times for an answer that was already there. So
+                            # re-sending the prompt for an answer that was already there is
+                            # unnecessary. So
                             # recover on any known cid, on a short leash without the marker
                             # so a genuine abort still fails fast.
                             recovery_deadline = (
@@ -2031,13 +1988,10 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                 f"Stream suspended (completed={is_completed}, final_chunk={is_final_chunk}, thinking={is_thinking}, queueing={is_queueing}). "
                                 f"{reason}. (Request ID: {_reqid})"
                             )
-                            # Close so the retry is a real refresh: `@running` re-runs
-                            # `init()` only when the client is stopped, and `init()` is what
-                            # picks a new backend, opening a new session and regenerating
-                            # the session id, `f.sid` and `_reqid` that decide routing. The
-                            # watchdog and the recovery timeout already close; a stream that
-                            # simply ends does not, which re-sent the prompt six times over
-                            # the same connection to the backend that just refused it.
+                            # Close the rejected connection before surfacing the error to
+                            # the outer request retry. The watchdog and recovery timeout
+                            # already close their connections; a stream that simply ends
+                            # does not.
                             await self.close()
                             raise APIError(
                                 "The original request may have been silently aborted by Google."

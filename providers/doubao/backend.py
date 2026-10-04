@@ -1,20 +1,20 @@
 from __future__ import annotations
 import asyncio
-import urllib.request
 
 import hashlib
 import json
 import uuid
 
-import aiohttp
+from curl_cffi import CurlMime
+from curl_cffi.requests import AsyncSession
 
 from utils.image_binary import image_media_type
+from utils.oss_reference import read_oss_reference
 
 
 def _prepare_reference_image(image_data: str) -> tuple[bytes, str]:
-    """在线程中完成参考图下载和压缩，避免阻塞代理事件循环。"""
-    with urllib.request.urlopen(image_data, timeout=30) as response:
-        image_bytes = response.read()
+    """在线程中从 OSS 读取参考图并压缩，避免阻塞代理事件循环。"""
+    image_bytes = read_oss_reference(image_data)
     # 大图压缩同样属于同步工作，必须与下载一起移出事件循环。
     if len(image_bytes) > 4 * 1024 * 1024:
         try:
@@ -43,15 +43,15 @@ def _prepare_reference_image(image_data: str) -> tuple[bytes, str]:
 
 class DoubaoBackendAPI:
     BASE_URL = "https://www.doubao.com"
-    DEFAULT_CHROMIUM_VERSION = "135.0.0.0"
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    DEFAULT_CHROMIUM_VERSION = "136.0.0.0"
+    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
     def __init__(self, cookies: dict[str, str], proxy: str = "", device_id: str = "", web_id: str = "", fp: str = "") -> None:
         if not cookies:
             raise ValueError("Doubao cookies are required")
         self.cookies = cookies
         self.proxy = proxy or None
-        self.session: aiohttp.ClientSession | None = None
+        self.session: AsyncSession | None = None
         # 账号专有设备指纹初始化（消除全局硬编码，实现多账号设备隔离）
         self.device_id = device_id or self._init_device_id()
         self.web_id = web_id or self._init_web_id()
@@ -84,22 +84,13 @@ class DoubaoBackendAPI:
         return f"verify_m{h[:7]}_{h[7:15]}_{h[15:19]}_4RuQ_BJPg_M5W7i58I7wV0"
 
     async def __aenter__(self):
-        connector = self._build_connector()
-        self.session = aiohttp.ClientSession(cookies=self.cookies, connector=connector,
+        # 同一账号本次请求的所有上游调用共用 Chrome 传输模拟和绑定代理。
+        self.session = AsyncSession(
+            cookies=self.cookies, proxy=self.proxy, impersonate="chrome136", timeout=300,
             headers={"User-Agent": self.USER_AGENT, "Origin": self.BASE_URL,
-                     "Referer": self.BASE_URL + "/chat", "Content-Type": "application/json"})
+                     "Referer": self.BASE_URL + "/chat"},
+        )
         return self
-
-    def _build_connector(self):
-        """账号配置了代理时返回代理连接器，保证所有出站请求走同一代理出口。"""
-        if self.proxy:
-            from aiohttp_socks import ProxyConnector
-            if self.proxy.lower().startswith("socks5h://"):
-                # aiohttp-socks uses socks5:// plus rdns=True for remote DNS.
-                proxy_url = "socks5://" + self.proxy[len("socks5h://"):]
-                return ProxyConnector.from_url(proxy_url, rdns=True)
-            return ProxyConnector.from_url(self.proxy)
-        return None
 
     async def __aexit__(self, *args):
         if self.session:
@@ -138,30 +129,35 @@ class DoubaoBackendAPI:
         ext = content_type.removeprefix("image/")
         actual_filename = f"image.{ext}"
 
-        form = aiohttp.FormData()
-        form.add_field("data", image_bytes, filename=actual_filename, content_type=content_type)
-        form.add_field("file_type", ext)
-        headers = {"User-Agent": self.USER_AGENT,
-                   "Origin": self.BASE_URL, "Referer": self.BASE_URL + "/chat",
-                   "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
-        upload_timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(cookies=self.cookies, headers=headers, timeout=upload_timeout,
-                                         connector=self._build_connector()) as upload_session:
-            async with upload_session.post(self.BASE_URL + "/samantha/pages/upload_image", params=self._params(), data=form) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Doubao image upload failed ({response.status})")
-                body = await response.json()
-                if body.get("code") != 0:
-                    raise RuntimeError(f"Doubao image upload error: {body.get('msg', body)}")
-                uri = body.get("data", {}).get("uri")
+        form = CurlMime.from_list([
+            {"name": "data", "data": image_bytes, "filename": actual_filename, "content_type": content_type},
+            {"name": "file_type", "data": ext.encode()},
+        ])
+        headers = {"x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
+        try:
+            response = await self.session.post(
+                self.BASE_URL + "/samantha/pages/upload_image", params=self._params(),
+                multipart=form, headers=headers, timeout=60,
+            )
+        finally:
+            form.close()
+        if response.status_code != 200:
+            raise RuntimeError(f"Doubao image upload failed ({response.status_code})")
+        body = response.json()
+        if body.get("code") != 0:
+            raise RuntimeError(f"Doubao image upload error: {body.get('msg', body)}")
+        uri = body.get("data", {}).get("uri")
         if not uri:
             raise RuntimeError("Doubao image upload returned no uri")
-        async with self.session.post(self.BASE_URL + "/alice/message/get_file_url", params=self._params(),
-                                     json={"uris": [uri], "type": "image", "format": ext, "expire_second": 3600}) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Doubao image URL lookup failed ({response.status})")
-            body = await response.json()
-            file_urls = (body.get("data") or {}).get("file_urls") or []
+        response = await self.session.post(
+            self.BASE_URL + "/alice/message/get_file_url", params=self._params(),
+            json={"uris": [uri], "type": "image", "format": ext, "expire_second": 3600},
+            headers={"Content-Type": "application/json"},
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Doubao image URL lookup failed ({response.status_code})")
+        body = response.json()
+        file_urls = (body.get("data") or {}).get("file_urls") or []
         if not file_urls:
             raise RuntimeError("Doubao image URL lookup returned no file")
         item = file_urls[0]
@@ -181,11 +177,12 @@ class DoubaoBackendAPI:
                                           "enable_commerce_credit": False}, "evaluate_option": {"web_ab_params": ""},
                    "local_conversation_id": str(uuid.uuid4()), "local_message_id": str(uuid.uuid4())}
         url = self.BASE_URL + "/samantha/chat/completion"
-        headers = {"Accept": "text/event-stream", "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
-        async with self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Doubao chat failed ({response.status}): {(await response.text())[:300]}")
-            raw = (await response.read()).decode("utf-8", errors="replace")
+        headers = {"Accept": "text/event-stream", "Content-Type": "application/json",
+                   "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
+        response = await self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers)
+        if response.status_code != 200:
+            raise RuntimeError(f"Doubao chat failed ({response.status_code}): {response.text[:300]}")
+        raw = response.content.decode("utf-8", errors="replace")
         text_parts: list[str] = []
         for block in raw.split("\n\n"):
             data_line = next((line[5:].strip() for line in block.splitlines() if line.startswith("data:")), "")
@@ -219,11 +216,12 @@ class DoubaoBackendAPI:
                    "action_bar_skill_id": 3}, "evaluate_option": {"web_ab_params": ""},
                    "local_conversation_id": str(uuid.uuid4()), "local_message_id": str(uuid.uuid4())}
         url = self.BASE_URL + "/samantha/chat/completion"
-        headers = {"Accept": "text/event-stream", "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
-        async with self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Doubao image failed ({response.status}): {(await response.text())[:300]}")
-            raw = (await response.read()).decode("utf-8", errors="replace")
+        headers = {"Accept": "text/event-stream", "Content-Type": "application/json",
+                   "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
+        response = await self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers)
+        if response.status_code != 200:
+            raise RuntimeError(f"Doubao image failed ({response.status_code}): {response.text[:300]}")
+        raw = response.content.decode("utf-8", errors="replace")
         urls: list[str] = []
         for block in raw.split("\n\n"):
             data_line = next((line[5:].strip() for line in block.splitlines() if line.startswith("data:")), "")
@@ -253,12 +251,12 @@ class DoubaoBackendAPI:
             raise RuntimeError("Doubao client is not initialized")
         results = []
         for url in urls:
-            async with self.session.get(url) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Doubao image download failed ({response.status})")
-                image_bytes = await response.read()
-                if image_media_type(image_bytes) is None:
-                    raise RuntimeError("Doubao image download did not return a valid image")
-                results.append(image_bytes)
+            response = await self.session.get(url)
+            if response.status_code != 200:
+                raise RuntimeError(f"Doubao image download failed ({response.status_code})")
+            image_bytes = response.content
+            if image_media_type(image_bytes) is None:
+                raise RuntimeError("Doubao image download did not return a valid image")
+            results.append(image_bytes)
         return results
 

@@ -243,7 +243,7 @@ class BaseAccountPool:
         self._restore_expired_cooldowns(now)
         candidates = []
         for account in self._accounts.values():
-            if account.get("status") != "active" or account.get("proxy_status") == "disabled" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+            if account.get("status") != "active" or account.get("proxy_status") == "disabled" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL or not self._account_ready(account):
                 continue
             if self._batches.get(account.get("name") or account.get("email"), {}).get("probing"):
                 continue
@@ -453,6 +453,7 @@ class BaseAccountPool:
                 account for account in self._accounts.values()
                 if account.get("status") == "active" and account.get("cooldown_until", 0) <= now
                 and account.get("proxy_status") != "disabled"
+                and self._account_ready(account)
                 and not self._batches.get(account.get("name") or account.get("email"), {}).get("probing")
             ]
             cooldowns = [
@@ -468,6 +469,9 @@ class BaseAccountPool:
             }
 
     # ── Hooks (override in subclasses) ──
+
+    def _account_ready(self, account: dict[str, Any]) -> bool:
+        return True
 
     def _select_strategy(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         """优先派发给最近最少使用的账号；同等时优先较少在途请求。"""

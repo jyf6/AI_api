@@ -18,7 +18,6 @@ test -f "$archive"
 test ! -e "$release"
 mkdir -p "$release"
 tar -xzf "$archive" -C "$release"
-ln -s /var/lib/flexi-ai/data "$release/data"
 
 cd "$release"
 /home/ubuntu/.local/bin/uv sync --locked --no-dev --no-install-project --python /usr/bin/python3.12

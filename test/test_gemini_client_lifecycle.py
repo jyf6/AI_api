@@ -3,10 +3,13 @@ import sys
 import time
 import types
 
+from curl_cffi.requests import Cookies
 from fastapi import HTTPException
 
-from providers.gemini.account import GeminiAccountPool
-from providers.gemini.backend import GeminiBackendAPI
+from providers.gemini.account import GeminiAccountPool, _restore_cookies
+from providers.gemini.backend import GeminiBackendAPI, _create_reference_images
+from providers.gemini.webapi.utils.rotate_1psidts import rotate_1psidts
+from providers.gemini.webapi.utils.upload_file import parse_file_name
 from api.routers import accounts
 from api.schemas import GeminiAccountRequest
 
@@ -37,6 +40,134 @@ class FakeClient:
     async def close(self):
         self.closed = True
         self._running = False
+
+
+def test_warmup_initializes_all_accounts_with_bounded_concurrency(monkeypatch, tmp_path):
+    class SlowClient(FakeClient):
+        in_progress = 0
+        peak = 0
+
+        async def init(self, **_kwargs):
+            type(self).in_progress += 1
+            type(self).peak = max(type(self).peak, type(self).in_progress)
+            try:
+                await asyncio.sleep(0.01)
+                self._running = True
+            finally:
+                type(self).in_progress -= 1
+
+    monkeypatch.setitem(sys.modules, "providers.gemini.webapi", types.SimpleNamespace(GeminiClient=SlowClient))
+    pool = GeminiAccountPool()
+    pool._data_file = tmp_path / "accounts.json"
+    pool._platform = ""
+    pool._accounts = {}
+    for i in range(12):
+        pool.add_account(f"account-{i}", f"__Secure-1PSID=psid-{i}; __Secure-1PSIDTS=ts-{i}")
+
+    async def run():
+        assert pool.capacity()["available_slots"] == 0
+        await pool.warmup_clients()
+        assert len(pool._clients) == 12
+        assert 1 < SlowClient.peak <= 5
+        assert pool.capacity()["available_slots"] == 12 * pool.MAX_INFLIGHT_TOTAL
+        await pool.close_clients()
+
+    asyncio.run(run())
+
+
+def test_verified_cookie_jar_is_stored_in_account_credentials(monkeypatch, tmp_path):
+    pool = GeminiAccountPool()
+    pool._data_file = tmp_path / "accounts.json"
+    pool._platform = ""
+    pool._accounts = {}
+    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old")
+    saved = []
+    monkeypatch.setattr("core.account_pool.database.import_account", lambda *args: saved.append(args))
+    pool._platform = "gemini"
+    jar = Cookies()
+    jar.set("__Secure-1PSID", "psid", domain=".google.com", secure=True)
+    jar.set("__Secure-1PSIDTS", "renewed", domain=".google.com", secure=True)
+    jar.set("SIDCC", "extra", domain=".google.com", secure=True)
+
+    pool.merge_cookie("main", dict(jar), jar)
+
+    credentials = saved[-1][2]
+    assert credentials["psidts"] == "renewed"
+    assert {entry["name"] for entry in credentials["cookie_jar"]} == {
+        "__Secure-1PSID", "__Secure-1PSIDTS", "SIDCC"
+    }
+    restored = _restore_cookies(credentials)
+    assert restored is not None and restored.get("SIDCC") == "extra"
+    assert "cookie_jar" not in pool.list_accounts()[0]
+
+
+def test_failed_cookie_database_write_is_retried(monkeypatch, tmp_path):
+    monkeypatch.setitem(sys.modules, "providers.gemini.webapi", types.SimpleNamespace(GeminiClient=FakeClient))
+    pool = GeminiAccountPool()
+    pool._data_file = tmp_path / "accounts.json"
+    pool._platform = ""
+    pool._accounts = {}
+    account = pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old")
+
+    async def run():
+        client = await pool.get_client(account)
+        pool._platform = "gemini"
+        client.cookies["__Secure-1PSIDTS"] = "renewed"
+
+        def unavailable(*_args):
+            raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr("core.account_pool.database.import_account", unavailable)
+        await pool.verify_refreshed_client("main", client)
+        assert "main" in pool._pending_cookie_saves
+
+        saved = []
+        monkeypatch.setattr("core.account_pool.database.import_account", lambda *args: saved.append(args))
+        pool._retry_pending_cookie_saves()
+        assert "main" not in pool._pending_cookie_saves
+        assert saved[-1][2]["psidts"] == "renewed"
+        await pool.close_clients()
+
+    asyncio.run(run())
+
+
+def test_rotation_only_reports_a_new_cookie(monkeypatch, tmp_path):
+    class Response:
+        status_code = 200
+        http_version = 2
+
+        def raise_for_status(self):
+            pass
+
+    class Session:
+        def __init__(self):
+            self.cookies = Cookies()
+            self.cookies.set("__Secure-1PSIDTS", "old", domain=".google.com", secure=True)
+            self.rotate = False
+
+        async def post(self, **_kwargs):
+            if self.rotate:
+                self.cookies.set("__Secure-1PSIDTS", "new", domain=".google.com", secure=True)
+            return Response()
+
+    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path))
+    session = Session()
+    assert asyncio.run(rotate_1psidts(session)) is None
+    session.rotate = True
+    assert asyncio.run(rotate_1psidts(session)) == "new"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_reference_image_stays_in_memory_with_its_file_type(monkeypatch):
+    monkeypatch.setattr(
+        "providers.gemini.backend._read_image_source",
+        lambda _source: (b"image-bytes", ".png"),
+    )
+    with _create_reference_images(["source"]) as images:
+        assert len(images) == 1
+        assert images[0].getvalue() == b"image-bytes"
+        assert parse_file_name(images[0]).endswith(".png")
+    assert images[0].closed
 
 
 def test_gemini_client_is_reused_until_pool_shutdown(monkeypatch, tmp_path):
@@ -90,46 +221,23 @@ def test_gemini_parallel_requests_keep_independent_clients(monkeypatch, tmp_path
     asyncio.run(run())
 
 
-def test_gemini_warmup_uses_manual_cookie_as_authoritative_source(monkeypatch, tmp_path):
+def test_gemini_warmup_uses_database_cookie(monkeypatch, tmp_path):
     FakeClient.created = 0
     monkeypatch.setitem(sys.modules, "providers.gemini.webapi", types.SimpleNamespace(GeminiClient=FakeClient))
-    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path))
-
-    # Write a cached cookies file with rotated psidts
-    cache_file = tmp_path / ".cached_cookies_my_psid.json"
-    cache_file.write_text(
-        '[{"name": "__Secure-1PSID", "value": "my_psid"}, {"name": "__Secure-1PSIDTS", "value": "new_rotated_ts"}]',
-        encoding="utf-8",
-    )
-
     pool = GeminiAccountPool()
     pool._data_file = tmp_path / "gemini_accounts.json"
     pool._platform = ""
     pool._accounts = {}
-    pool.add_account("test_warmup", "__Secure-1PSID=my_psid; __Secure-1PSIDTS=old_ts")
+    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=ts")
 
     async def run():
-        # Warmup should eagerly initialize the client
         await pool.warmup_clients()
-        assert "test_warmup" in pool._clients
-        # 代理只把人工双 Cookie 交给上游；上游自行决定是否使用已验证缓存。
-        client = pool._clients["test_warmup"]
-        assert client.cookies == {}
-        assert pool._accounts["test_warmup"]["psidts"] == "old_ts"
-
-        # 临时错误释放占用但不停止账号。
-        pool.release_account("test_warmup", False, error="Google stream error 1100")
-        assert pool._accounts["test_warmup"]["status"] == "active"
-        assert pool._accounts["test_warmup"]["cooldown_until"] > time.time()
-
-        # 明确未认证才停止账号。
-        pool.release_account("test_warmup", False, error="401 Unauthorized")
-        assert pool._accounts["test_warmup"]["status"] == "error"
-
+        assert "main" in pool._clients
+        assert pool.capacity()["available_slots"] == pool.MAX_INFLIGHT_TOTAL
         await pool.close_clients()
+        assert pool.capacity()["available_slots"] == 0
 
     asyncio.run(run())
-
 
 def test_gemini_api_refresh_callback_verifies_before_persisting(monkeypatch, tmp_path):
     """续期后只由 Gemini-API 回调验证，代理不得再自行轮换 Cookie。"""
@@ -154,45 +262,18 @@ def test_gemini_api_refresh_callback_verifies_before_persisting(monkeypatch, tmp
     asyncio.run(run())
 
 
-def test_discard_client_keeps_latest_cookie_cache(monkeypatch, tmp_path):
-    FakeClient.created = 0
-    monkeypatch.setitem(sys.modules, "providers.gemini.webapi", types.SimpleNamespace(GeminiClient=FakeClient))
-    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path))
-    cache_file = tmp_path / ".cached_cookies_psid.json"
-    cache_file.write_text("[]", encoding="utf-8")
-
+def test_manual_cookie_update_replaces_stored_cookie_jar(monkeypatch, tmp_path):
     pool = GeminiAccountPool()
     pool._data_file = tmp_path / "gemini_accounts.json"
     pool._platform = ""
     pool._accounts = {}
-    account = pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts")
-    # 模拟客户端运行后写入的缓存；discard 不应删除这份非人工更新缓存。
-    cache_file.write_text("[]", encoding="utf-8")
+    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old_ts")
+    pool._accounts["main"]["cookie_jar"] = [{"name": "__Secure-1PSIDTS", "value": "old_ts"}]
 
-    async def run():
-        await pool.get_client(account)
-        await pool.discard_client("main")
+    pool.update_cookie("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=fresh_ts")
 
-    asyncio.run(run())
-    assert cache_file.exists()
-
-
-def test_manual_cookie_update_discards_stale_cache(monkeypatch, tmp_path):
-    """人工更新 Cookie 后，旧磁盘缓存不能覆盖新的 PSIDTS。"""
-    monkeypatch.setenv("GEMINI_COOKIE_PATH", str(tmp_path))
-    cache_file = tmp_path / ".cached_cookies_psid.json"
-    cache_file.write_text(
-        '[{"name": "__Secure-1PSID", "value": "psid"}, {"name": "__Secure-1PSIDTS", "value": "stale_ts"}]',
-        encoding="utf-8",
-    )
-
-    pool = GeminiAccountPool()
-    pool._data_file = tmp_path / "gemini_accounts.json"
-    pool._platform = ""
-    pool._accounts = {}
-    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=fresh_ts")
-
-    assert not cache_file.exists()
+    assert pool._accounts["main"]["psidts"] == "fresh_ts"
+    assert pool._accounts["main"]["cookie_jar"] == []
 
 
 def test_gemini_client_rejects_unauthenticated_init(monkeypatch, tmp_path):
@@ -218,34 +299,6 @@ def test_gemini_client_rejects_unauthenticated_init(monkeypatch, tmp_path):
     asyncio.run(run())
     assert "main" not in pool._clients
 
-
-def test_gemini_client_retries_with_database_cookie_after_cached_session_is_unauthenticated(monkeypatch, tmp_path):
-    class CacheThenDatabaseClient(FakeClient):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._cookie_source = "Cache" if type(self).created == 1 else "Base Cookies"
-            self.authenticated = type(self).created > 1
-
-        def _check_account_status(self, raise_error=False):
-            return self.authenticated
-
-    CacheThenDatabaseClient.created = 0
-    monkeypatch.setitem(
-        sys.modules,
-        "providers.gemini.webapi",
-        types.SimpleNamespace(GeminiClient=CacheThenDatabaseClient),
-    )
-    pool = GeminiAccountPool()
-    pool._data_file = tmp_path / "gemini_accounts.json"
-    pool._platform = ""
-    pool._accounts = {}
-    account = pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=psidts")
-
-    client = asyncio.run(pool.get_client(account))
-
-    assert CacheThenDatabaseClient.created == 2
-    assert client._cookie_source == "Base Cookies"
-    assert "main" in pool._clients
 
 
 def test_expired_refresh_cooldown_is_restored_on_startup_and_account_is_schedulable(monkeypatch, tmp_path):
@@ -317,7 +370,7 @@ def test_new_gemini_account_starts_its_refresh_client(monkeypatch):
         async def discard_client(self, name):
             pass
 
-        def add_account(self, name, cookie, proxy):
+        def add_account(self, name, cookie, proxy, proxy_id=None):
             return {"name": name, "cookie": cookie, "proxy": proxy, "status": "active"}
 
         async def get_client(self, account):

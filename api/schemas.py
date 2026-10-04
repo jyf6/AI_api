@@ -12,7 +12,7 @@ class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="生成图片的提示词")
     model: str = "gpt-image"
     aspect_ratio: str = Field(..., description="约分后的宽高比，如 3:4")
-    images: list[str] = Field(default_factory=list)
+    images: list[str] = Field(default_factory=list, description="参考图的阿里云 OSS objectKey 列表")
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     dispatch_id: int | None = None
     task_code: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
@@ -37,7 +37,7 @@ class OAuthCallbackRequest(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "gpt-chat"
     prompt: str = Field(..., min_length=1)
-    images: list[str] = Field(default_factory=list)
+    images: list[str] = Field(default_factory=list, description="参考图的阿里云 OSS objectKey 列表")
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     dispatch_id: int | None = None
     task_code: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")

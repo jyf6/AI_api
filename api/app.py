@@ -44,11 +44,16 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         from providers.gemini.account import gemini_account_service
 
-        redis_client = Redis.from_url("redis://127.0.0.1:6379/0", decode_responses=True)
+        redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
         capacity_task = asyncio.create_task(publish_capacity_snapshots(redis_client))
-        # 服务启动即并发预热活跃账号，由项目内 Gemini Web API 接管后台保活与 Cookie 续期。
-        warmup_task = asyncio.create_task(gemini_account_service.warmup_clients())
+        # 后台限并发预热，并持续恢复中断的续期客户端。
+        warmup_task = asyncio.create_task(gemini_account_service.maintain_clients())
         yield
+        warmup_task.cancel()
+        try:
+            await warmup_task
+        except asyncio.CancelledError:
+            pass
         await gemini_account_service.close_clients()
         capacity_task.cancel()
         try:
@@ -56,10 +61,6 @@ def create_app() -> FastAPI:
         except asyncio.CancelledError:
             pass
         await redis_client.aclose()
-        try:
-            warmup_task.cancel()
-        except Exception:
-            pass
 
     app = FastAPI(title="ChatGPT-Image-Service", version="2.0.0", lifespan=lifespan)
 

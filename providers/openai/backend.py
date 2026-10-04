@@ -1,6 +1,5 @@
 from __future__ import annotations
 import hashlib
-import urllib.request
 import uuid
 
 import json
@@ -15,6 +14,7 @@ from curl_cffi import requests
 from utils.helper import ImageQuotaExceededError, ensure_ok, iter_sse_payloads
 from utils.log import logger
 from utils.image_binary import image_media_type
+from utils.oss_reference import read_oss_reference
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
 
@@ -243,7 +243,7 @@ class OpenAIBackendAPI:
         return 0, 0
 
     def _upload_image_data(self, value: str, file_name: str = "image.png") -> dict[str, Any]:
-        data = urllib.request.urlopen(value, timeout=30).read()
+        data = read_oss_reference(value)
         mime = image_media_type(data)
         if mime is None:
             raise RuntimeError("GPT reference download did not return a valid image")

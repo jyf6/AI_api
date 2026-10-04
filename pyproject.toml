@@ -24,6 +24,7 @@ dependencies = [
     "redis>=5.0.0",
     "rembg>=2.0.84",
     "onnxruntime>=1.29.0",
+    "oss2>=2.19.1",
 ]
 
 [dependency-groups]

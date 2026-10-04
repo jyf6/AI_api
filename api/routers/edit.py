@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import io
+from threading import Lock
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 from PIL import Image, ImageFilter
 import cv2
@@ -9,18 +10,23 @@ import numpy as np
 router = APIRouter(prefix="/api/edit", tags=["edit"])
 
 u2net_session = None
-try:
-    from rembg import new_session
-    u2net_session = new_session("u2netp")
-    print("Pre-initialized u2netp session successfully in chatgpt2api.")
-except Exception as e:
-    print(f"Warning: Failed to pre-init rembg session: {e}")
+u2net_lock = Lock()
 
 
 @router.post("/remove-bg")
 def remove_bg(file: UploadFile = File(...)):
+    global u2net_session
     try:
         content = file.file.read()
+        # 首次抠图时再加载模型，避免下载模型阻塞整个代理服务启动。
+        if u2net_session is None:
+            with u2net_lock:
+                if u2net_session is None:
+                    try:
+                        from rembg import new_session
+                        u2net_session = new_session("u2netp")
+                    except Exception as rembg_err:
+                        print(f"rembg initialization failed, falling back to GrabCut: {rembg_err}")
         if u2net_session is not None:
             try:
                 from rembg import remove
