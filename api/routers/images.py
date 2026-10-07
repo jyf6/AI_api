@@ -123,6 +123,36 @@ async def _generate_images(body: ImageGenerationRequest):
         request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
         body.stage, resolved.platform, resolved.model, len(body.images),
     )
+
+    if len(body.images) > 0:
+        try:
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
+            from utils.oss_reference import read_oss_reference, put_memory_reference
+            from utils.image_stitch import stitch_images_to_bytes, compress_single_image
+            
+            def process_images(images, stage):
+                with ThreadPoolExecutor(max_workers=min(10, len(images))) as executor:
+                    bytes_list = list(executor.map(read_oss_reference, images))
+                    
+                if len(images) > 2:
+                    if stage == "INITIAL_IMAGE_GENERATION":
+                        stitched = stitch_images_to_bytes(bytes_list)
+                        return [put_memory_reference(stitched)]
+                    elif stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
+                        base_img_bytes = compress_single_image(bytes_list[0])
+                        stitched = stitch_images_to_bytes(bytes_list[1:])
+                        return [put_memory_reference(base_img_bytes), put_memory_reference(stitched)]
+                        
+                return [put_memory_reference(compress_single_image(b)) for b in bytes_list]
+                
+            new_images = await asyncio.to_thread(process_images, body.images, body.stage)
+            if new_images != body.images:
+                logger.info("event=images_processed request_id=%s old_count=%d new_count=%d", request_id, len(body.images), len(new_images))
+                body = body.model_copy(update={"images": new_images})
+        except Exception as e:
+            logger.warning("event=image_process_failed request_id=%s reason=%s", request_id, type(e).__name__)
+
     for attempt in range(2):
         try:
             raw_image = await _generate_images_once(body, resolved, prompt, request_id, attempt + 1)
