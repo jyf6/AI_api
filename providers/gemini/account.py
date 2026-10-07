@@ -7,7 +7,9 @@ from typing import Any
 
 from curl_cffi.requests import Cookies
 
-from core.account_pool import BaseAccountPool
+from core.account_pool import BaseAccountPool, serialized_account_edit
+from core.database import database
+from core.blocking import run_blocking
 from providers.gemini.webapi import AuthError
 from utils.helper import parse_cookie_string
 from utils.log import logger
@@ -98,9 +100,11 @@ class GeminiAccountPool(BaseAccountPool):
         self._request_generations: dict[str, int] = {}
         self._warmup_limit = 5
         self._pending_cookie_saves: set[str] = set()
+        self._cookie_save_locks: dict[str, asyncio.Lock] = {}
 
     # ── Cookie-based Account Integration ──
 
+    @serialized_account_edit
     def add_account(self, name: str, cookie: str, proxy: str = "", proxy_id: int | None = None) -> dict[str, Any]:
         psid, psidts = _parse_auth_cookie(cookie)
         account_name = name.strip() or f"gemini-{int(time.time())}"
@@ -129,13 +133,11 @@ class GeminiAccountPool(BaseAccountPool):
             )
             if duplicate:
                 raise ValueError(f"该 __Secure-1PSID 已被账号 [{duplicate}] 使用")
-            self._accounts[account["name"]] = account
-            self._save(account["name"])
-            self._condition.notify_all()
-        return account
+        return self._register_account(account["name"], account)
 
     # ── Gemini-specific: cookie management ──
 
+    @serialized_account_edit
     def update_cookie(self, name: str, cookie: str) -> bool:
         psid, psidts = _parse_auth_cookie(cookie)
         with self._condition:
@@ -149,53 +151,62 @@ class GeminiAccountPool(BaseAccountPool):
             )
             if duplicate:
                 raise ValueError(f"该 __Secure-1PSID 已被账号 [{duplicate}] 使用")
-            account["cookie"] = _auth_cookie_header(psid, psidts)
-            account["psid"] = psid
-            account["psidts"] = psidts
-            account["cookie_jar"] = []
-            # 更新 Cookie 即视为人工恢复账号，代理与在途请求计数保持不变。
-            account["status"] = "active"
-            account["cooldown_until"] = 0
-            account["failure_count"] = 0
-            account["error_message"] = ""
-            self._save(name)
-            self._condition.notify_all()
-            return True
+        return self._replace_cookie_fields(name, {
+            "cookie": _auth_cookie_header(psid, psidts), "psid": psid, "psidts": psidts, "cookie_jar": []
+        })
 
-    def merge_cookie(self, name: str, updates: dict[str, str], jar: Any = None) -> None:
-        with self._lock:
-            account = self._accounts.get(name)
-            if not account or not updates:
-                return
-            psid = updates.get("__Secure-1PSID") or account.get("psid", "")
-            psidts = updates.get("__Secure-1PSIDTS") or account.get("psidts", "")
-            if not psid or not psidts:
-                return
-            account["cookie"] = _auth_cookie_header(psid, psidts)
-            account["psid"] = psid
-            account["psidts"] = psidts
-            if jar is not None:
-                account["cookie_jar"] = _stored_cookies(jar)
-            try:
-                self._save(name)
-            except Exception:
+    async def merge_cookie(self, name: str, updates: dict[str, str], jar: Any = None,
+                           expected_generation: int | None = None) -> None:
+        """续期写库在池锁外执行；版本校验阻止旧客户端覆盖人工更新的凭证。"""
+        async with self._cookie_save_locks.setdefault(name, asyncio.Lock()):
+            with self._condition:
+                account = self._accounts.get(name)
+                if account is None:
+                    self._pending_cookie_saves.discard(name)
+                    return
+                if (expected_generation is not None
+                        and self._request_generations.get(name, 0) != expected_generation):
+                    return
+                psid = updates.get("__Secure-1PSID") or account["psid"]
+                psidts = updates.get("__Secure-1PSIDTS") or account["psidts"]
+                account.update(cookie=_auth_cookie_header(psid, psidts), psid=psid, psidts=psidts)
+                if jar is not None:
+                    account["cookie_jar"] = _stored_cookies(jar)
+                snapshot = dict(account)
                 self._pending_cookie_saves.add(name)
-                raise
+            if self._platform:
+                patch = {field: snapshot[field] for field in ("cookie", "psid", "psidts", "cookie_jar")}
+                saved = await run_blocking(database.update_credentials, "gemini", name, patch,
+                                           snapshot["credential_version"], snapshot["account_id"])
+                replacement = None if saved else await run_blocking(database.list_accounts, "gemini", name)
+                with self._condition:
+                    current = self._accounts.get(name)
+                    if (saved and current is not None and current["account_id"] == snapshot["account_id"]
+                            and current["credential_version"] == snapshot["credential_version"]):
+                        current["credential_version"] += 1
+                        self._pending_cookie_saves.discard(name)
+                        self._save_health(name)
+                        self._condition.notify_all()
+                    elif not saved:
+                        # 数据库中的人工登录/代理更新优先，旧客户端的续期结果不能回写。
+                        if (current is not None and current["account_id"] == snapshot["account_id"]
+                                and current["credential_version"] == snapshot["credential_version"] and replacement):
+                            current.update(replacement[0])
+                        self._pending_cookie_saves.discard(name)
+                        self._condition.notify_all()
+                        logger.warning("Gemini Cookie persistence version changed; current credentials retained")
             else:
+                await run_blocking(self._save, name)
                 self._pending_cookie_saves.discard(name)
 
-    def _retry_pending_cookie_saves(self) -> None:
+    async def _retry_pending_cookie_saves(self) -> None:
         with self._condition:
-            for name in list(self._pending_cookie_saves):
-                if name not in self._accounts:
-                    self._pending_cookie_saves.discard(name)
-                    continue
-                try:
-                    self._save(name)
-                except Exception as exc:
-                    logger.warning(f"[Gemini Cookie] 账号 [{name}] 续期凭证写库仍失败: {exc}")
-                else:
-                    self._pending_cookie_saves.discard(name)
+            pending = list(self._pending_cookie_saves)
+        for name in pending:
+            try:
+                await self.merge_cookie(name, {})
+            except Exception as exc:
+                logger.warning("Gemini Cookie persistence retry failed reason=%s", type(exc).__name__)
 
     @staticmethod
     def is_auth_error(error: Exception | str) -> bool:
@@ -205,52 +216,67 @@ class GeminiAccountPool(BaseAccountPool):
             marker in text for marker in ("unauthenticated", "unauthorized", "cookie", "expired", "401", "未认证")
         )
 
-    def mark_auth_failed(self, name: str, error: Exception | str) -> None:
+    def mark_auth_failed(self, name: str, error: Exception | str, expected_account: dict | None = None) -> None:
         """认证失效时停用账号，但保留最近一次成功轮换的本地缓存。"""
         with self._condition:
-            account = self._accounts[name]
+            account = self._accounts.get(name)
+            if account is None or (expected_account is not None and any(
+                account.get(field) != expected_account.get(field) for field in ("account_id", "credential_version")
+            )):
+                return
             account["status"] = "error"
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500] or "Gemini Cookie 未认证，请更新 Cookie"
-            self._save(name)
+            self._save_health(name)
             self._condition.notify_all()
 
-    def mark_refresh_verification_failed(self, name: str, error: Exception | str) -> None:
+    def mark_refresh_verification_failed(self, name: str, error: Exception | str, expected_account: dict | None = None) -> None:
         """续期后验证失败时暂停账号；下次 Gemini-API 续期验证成功后自动恢复。"""
         if self.is_auth_error(error):
-            self.mark_auth_failed(name, error)
+            self.mark_auth_failed(name, error, expected_account)
             return
         with self._condition:
-            account = self._accounts[name]
+            account = self._accounts.get(name)
+            if account is None or (expected_account is not None and any(
+                account.get(field) != expected_account.get(field) for field in ("account_id", "credential_version")
+            )):
+                return
             account["status"] = "cooldown"
             account["cooldown_until"] = int(time.time() + 300)
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500]
-            self._save(name)
+            self._save_health(name)
             self._condition.notify_all()
 
     async def verify_refreshed_client(self, name: str, client: Any) -> None:
         """续期后只校验账号认证状态，避免周期性生成请求误判账号并消耗额度。"""
+        with self._condition:
+            if self._clients.get(name) is not client:
+                return
+            expected_account = dict(self._accounts[name])
         try:
             await client._fetch_user_status()
             if not client._check_account_status():
                 raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
         except Exception as exc:
-            self.mark_refresh_verification_failed(name, exc)
+            self.mark_refresh_verification_failed(name, exc, expected_account)
             logger.warning(f"[Gemini Refresh Verify] 账号 [{name}] 续期后测试失败: {exc}")
             return
 
         with self._condition:
             if (self._clients.get(name) is not client
-                    or self._accounts.get(name, {}).get("status") not in {"active", "cooldown"}):
+                    or self._accounts.get(name, {}).get("status") not in {"active", "cooldown"}
+                    or any(self._accounts[name].get(field) != expected_account.get(field)
+                           for field in ("account_id", "credential_version"))):
                 return
             account = self._accounts[name]
             account["status"] = "active"
             account["cooldown_until"] = 0
             account["failure_count"] = 0
             account["error_message"] = ""
+            generation = self._request_generations.get(name, 0)
         try:
-            self.merge_cookie(name, dict(client.cookies), client.cookies)
+            await self.merge_cookie(name, dict(client.cookies), client.cookies, generation)
         except Exception as exc:
             logger.error(f"[Gemini Cookie] 账号 [{name}] 登录态有效但写库失败，将继续重试: {exc}")
             return
@@ -311,8 +337,15 @@ class GeminiAccountPool(BaseAccountPool):
                     current["cooldown_until"] = 0
                     current["failure_count"] = 0
                     current["error_message"] = ""
-                self.merge_cookie(name, dict(client.cookies), client.cookies)
+                await self.merge_cookie(name, dict(client.cookies), client.cookies, generation)
                 with self._condition:
+                    current = self._accounts[name]
+                    # 锁外保存期间可能人工替换 Cookie/代理，旧客户端不能重新进入缓存。
+                    if (self._request_generations.get(name, 0) != generation
+                            or current.get("account_id") != account.get("account_id")
+                            or current["psid"] != account["psid"]
+                            or current.get("proxy", "") != account.get("proxy", "")):
+                        raise RuntimeError("Gemini 账号在凭证保存期间已变更")
                     self._clients[name] = client
                     self._condition.notify_all()
                 logger.info(f"[Gemini Client] 账号 [{name}] 已认证，后台续期已启动")
@@ -351,7 +384,7 @@ class GeminiAccountPool(BaseAccountPool):
                     await self.get_client(acc)
                 except Exception as exc:
                     if self.is_auth_error(exc):
-                        self.mark_auth_failed(acc["name"], exc)
+                        self.mark_auth_failed(acc["name"], exc, acc)
                     logger.warning(f"[Gemini Warmup] 账号 [{acc['name']}] 预热失败: {exc}")
 
         await asyncio.gather(*(warm_one(acc) for acc in active_accounts))
@@ -360,7 +393,7 @@ class GeminiAccountPool(BaseAccountPool):
         """Retry failed initializations and recreate stopped refresh tasks."""
         while True:
             try:
-                self._retry_pending_cookie_saves()
+                await self._retry_pending_cookie_saves()
                 await self.warmup_clients()
             except Exception as exc:
                 logger.error(f"[Gemini Warmup] 后台维护失败，将在一分钟后重试: {exc}")
@@ -413,11 +446,16 @@ class GeminiAccountPool(BaseAccountPool):
     def _account_ready(self, account: dict[str, Any]) -> bool:
         return self._client_ready(self._clients.get(account["name"]))
 
-    async def discard_client(self, name: str) -> None:
+    async def discard_client(self, name: str, expected_account: dict | None = None) -> None:
         # 只关闭空闲连接；正在使用的请求在退出时按代次自行关闭。
-        self._request_generations[name] = self._request_generations.get(name, 0) + 1
-        idle = self._idle_request_clients.pop(name, [])
         with self._condition:
+            current = self._accounts.get(name)
+            if expected_account is not None and (current is None or any(
+                current.get(field) != expected_account.get(field) for field in ("account_id", "credential_version")
+            )):
+                return
+            self._request_generations[name] = self._request_generations.get(name, 0) + 1
+            idle = self._idle_request_clients.pop(name, [])
             client = self._clients.pop(name, None)
             self._condition.notify_all()
         for request_client in idle:
@@ -474,7 +512,7 @@ class GeminiAccountPool(BaseAccountPool):
             client = await self.get_client(account_copy)
         except Exception as exc:
             if self.is_auth_error(exc):
-                self.mark_auth_failed(name, exc)
+                self.mark_auth_failed(name, exc, account_copy)
             raise
 
         registry = getattr(client, "_model_registry", {})
@@ -492,12 +530,22 @@ class GeminiAccountPool(BaseAccountPool):
 
         with self._condition:
             current = self._accounts.get(name)
-            if not current:
-                raise ValueError(f"Account {name} not found")
-            current["supported_models"] = models
-            current["models_updated_at"] = int(time.time())
-            self._save(name)
-            self._condition.notify_all()
+            if current is None or self._clients.get(name) is not client:
+                raise ValueError("账号已更新，请重新获取模型列表")
+            snapshot = dict(current)
+        updated_at = int(time.time())
+        saved = not self._platform or await run_blocking(
+            database.update_supported_models, "gemini", name, models, updated_at,
+            snapshot["credential_version"], snapshot["account_id"]
+        )
+        with self._condition:
+            current = self._accounts.get(name)
+            if saved and current is not None and all(current.get(field) == snapshot.get(field)
+                                                    for field in ("account_id", "credential_version")):
+                current.update(supported_models=models, models_updated_at=updated_at)
+                self._condition.notify_all()
+        if not self._platform:
+            await run_blocking(self._save, name)
         return models
 
 

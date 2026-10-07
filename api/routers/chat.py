@@ -7,18 +7,20 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from api.schemas import ChatCompletionRequest
-from core.account_pool import await_thread_result
 from core.router import resolve_model
+from core.admission import CapacityUnavailable
+from api.model_execution import execute_model_request
 from providers.doubao.account import doubao_account_service
 from providers.doubao.backend import DoubaoBackendAPI
 from providers.gemini.account import gemini_account_service
 from providers.gemini.backend import GeminiBackendAPI
 from providers.openai.account import account_service
 from providers.openai.backend import OpenAIBackendAPI
+from providers.openai.credentials import CredentialUnavailable
 from utils.helper import UpstreamHTTPError, is_transport_error
 from utils.log import logger, proxy_log_ref, stable_log_ref
 
@@ -96,12 +98,12 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
                 text = await backend.chat(prompt, images, resolved.model)
             logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
                         request_id, attempt, account_ref, proxy_ref)
-            gemini_account_service.release_account(account["name"], True, task_type="chat")
+            gemini_account_service.release_account(account["name"], True, task_type="chat", acquired_account=account)
             return text
         except asyncio.CancelledError:
             logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
                            request_id, attempt, account_ref, proxy_ref)
-            gemini_account_service.release_account(account["name"], False, task_type="chat")
+            gemini_account_service.release_account(account["name"], False, task_type="chat", acquired_account=account)
             raise
         except Exception as exc:
             logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=gemini account_ref=%s proxy_ref=%s reason=%s status=%s",
@@ -109,7 +111,7 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
             # 本次连接已由 GeminiBackendAPI 单独回收，其他并发请求继续执行。
             gemini_account_service.release_account(
                 account["name"], False, str(exc), status_code=getattr(exc, "status_code", None),
-                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account",
+                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account", acquired_account=account,
             )
             raise
     elif resolved.platform == "doubao":
@@ -124,19 +126,19 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
                 text = await backend.chat(prompt, attachments)
             logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s",
                         request_id, attempt, account_ref, proxy_ref)
-            doubao_account_service.release_account(account["name"], True, task_type="chat")
+            doubao_account_service.release_account(account["name"], True, task_type="chat", acquired_account=account)
             return text
         except asyncio.CancelledError:
             logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s",
                            request_id, attempt, account_ref, proxy_ref)
-            doubao_account_service.release_account(account["name"], False, task_type="chat")
+            doubao_account_service.release_account(account["name"], False, task_type="chat", acquired_account=account)
             raise
         except Exception as exc:
             logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=doubao account_ref=%s proxy_ref=%s reason=%s status=%s",
                          request_id, attempt, account_ref, proxy_ref, type(exc).__name__, getattr(exc, "status_code", None))
             doubao_account_service.release_account(
                 account["name"], False, str(exc), status_code=getattr(exc, "status_code", None),
-                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account",
+                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account", acquired_account=account,
             )
             raise
     else:
@@ -146,34 +148,33 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
         logger.info("event=upstream_attempt_started request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
                     request_id, attempt, account_ref, proxy_ref)
         try:
-            def run() -> str:
-                try:
-                    with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", "")) as backend:
-                        text = backend.chat_text(prompt, images, resolved.model)
-                except Exception as exc:
-                    status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
-                    account_service.release_account(account["email"], False, str(exc), status_code=status,
-                                                    task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account")
-                    raise
-                account_service.release_account(account["email"], True, task_type="chat")
-                return text
-
-            text = await await_thread_result(run)
-            logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
-                        request_id, attempt, account_ref, proxy_ref)
+            async with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", ""),
+                    credential_provider=lambda: account_service.prepare_request_account(account)) as backend:
+                text = await backend.chat_text(prompt, images, resolved.model)
+            account_service.release_account(account["email"], True, task_type="chat", acquired_account=account)
+            logger.info("event=upstream_attempt_succeeded request_id=%s attempt=%d platform=gpt", request_id, attempt)
             return text
         except asyncio.CancelledError:
-            logger.warning("event=upstream_attempt_cancelled request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
-                           request_id, attempt, account_ref, proxy_ref)
+            account_service.release_account(account["email"], False, task_type="chat", acquired_account=account)
             raise
         except Exception as exc:
-            logger.error("event=upstream_attempt_failed request_id=%s attempt=%d platform=gpt account_ref=%s proxy_ref=%s reason=%s status=%s",
-                         request_id, attempt, account_ref, proxy_ref, type(exc).__name__, getattr(exc, "status_code", None))
+            account_service.release_account(
+                account["email"], False, str(exc), status_code=getattr(exc, "status_code", None),
+                task_type="chat", failure_scope="transport" if is_transport_error(exc) else "account", acquired_account=account,
+            )
             raise
+
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(body: ChatCompletionRequest):
+async def chat_completions(body: ChatCompletionRequest, request: Request):
+    resolved = resolve_model(body.model, "chat")
+    request_id = body.request_id or uuid.uuid4().hex
+    body = body.model_copy(update={"request_id": request_id})
+    return await execute_model_request(resolved.platform, request_id, lambda: _chat_completions(body), request=request)
+
+
+async def _chat_completions(body: ChatCompletionRequest):
     """
     多模态对话与分析接口：
     具备代理侧智能文本校验与就地自动重试机制。
@@ -233,6 +234,11 @@ async def chat_completions(body: ChatCompletionRequest):
                 content={"code": 0, "model": body.model, "text": text, "created": int(time.time())},
                 headers={"X-Request-ID": request_id},
             )
+        except CapacityUnavailable:
+            raise
+        except CredentialUnavailable as exc:
+            raise HTTPException(status_code=502, detail="GPT credential preparation failed",
+                                headers={"X-Request-ID": request_id}) from exc
         except HTTPException:
             raise
         except Exception as exc:

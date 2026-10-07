@@ -86,7 +86,7 @@ class Database:
                         if not cursor.fetchone():
                             conn.rollback()
                             return False
-                    cursor.execute("UPDATE ai_proxy_account SET proxy=%s WHERE proxy_id=%s",
+                    cursor.execute("UPDATE ai_proxy_account SET proxy=%s,credential_version=credential_version+1 WHERE proxy_id=%s",
                                    (proxy_url.strip(), proxy_id))
                 conn.commit()
                 return True
@@ -125,7 +125,7 @@ class Database:
                                (proxy_id,))
 
 
-    def import_account(self, platform: str, name: str, credentials: dict[str, Any], proxy: str = "", status: str = "active", cooldown_until: int = 0, failure_count: int = 0, error_message: str = "", proxy_id: int | None = None) -> None:
+    def import_account(self, platform: str, name: str, credentials: dict[str, Any], proxy: str = "", status: str = "active", cooldown_until: int = 0, failure_count: int = 0, error_message: str = "", proxy_id: int | None = None) -> dict[str, int]:
         # 明确的节点 ID 优先；旧版本账号配置继续通过原 URL 自动登记。
         if proxy_id:
             node = self.get_proxy_node(proxy_id)
@@ -137,15 +137,86 @@ class Database:
         with self._connect() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""INSERT INTO ai_proxy_account(platform,account_name,credentials,proxy,proxy_id,status,cooldown_until,failure_count,error_message)
-                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE credentials=VALUES(credentials), proxy=VALUES(proxy), proxy_id=VALUES(proxy_id), status=VALUES(status), cooldown_until=VALUES(cooldown_until), failure_count=VALUES(failure_count), error_message=VALUES(error_message)""",
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE credentials=VALUES(credentials), credential_version=credential_version+1, proxy=VALUES(proxy), proxy_id=VALUES(proxy_id), status=VALUES(status), cooldown_until=VALUES(cooldown_until), failure_count=VALUES(failure_count), error_message=VALUES(error_message)""",
                     (platform, name, json.dumps(credentials, ensure_ascii=False), proxy, proxy_id, status, cooldown_until, failure_count, error_message))
+                # 返回真实行身份与版本，使 Cookie 保存后的健康更新也使用正确 CAS。
+                cursor.execute("SELECT id AS account_id,credential_version FROM ai_proxy_account WHERE platform=%s AND account_name=%s", (platform, name))
+                return cursor.fetchone()
 
-    def list_accounts(self, platform: str) -> list[dict[str, Any]]:
+    def update_credentials(self, platform: str, name: str, patch: dict[str, Any], expected_version: int, account_id: int) -> bool:
+        """原子保存轮换凭证；版本已变时不覆盖重新登录后的身份。"""
         with self._connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("""SELECT a.account_name,a.credentials,a.proxy,a.proxy_id,a.status,a.cooldown_until,a.failure_count,a.error_message,
+                cursor.execute(
+                    "UPDATE ai_proxy_account SET credentials=JSON_MERGE_PATCH(credentials,%s), "
+                    "credential_version=credential_version+1 WHERE platform=%s AND account_name=%s AND credential_version=%s AND id=%s",
+                    (json.dumps(patch, ensure_ascii=False), platform, name, expected_version, account_id),
+                )
+                return cursor.rowcount == 1
+
+    def save_account_health(self, platform: str, name: str, account: dict[str, Any]) -> None:
+        """健康状态写入不回写凭证或代理；旧身份产生的状态不影响新登录。"""
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE ai_proxy_account SET status=%s,cooldown_until=%s,failure_count=%s,error_message=%s "
+                    "WHERE platform=%s AND account_name=%s AND credential_version=%s AND id=%s",
+                    (account.get("status", "active"), account.get("cooldown_until", 0),
+                     account.get("failure_count", 0), account.get("error_message", ""),
+                     platform, name, account.get("credential_version", 0), account["account_id"]),
+                )
+
+    def update_supported_models(self, platform: str, name: str, models: list,
+                                updated_at: int, expected_version: int, account_id: int) -> bool:
+        """模型发现只更新元数据，不推进身份版本，避免使在途 OAuth 轮换 CAS 失效。"""
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE ai_proxy_account SET credentials=JSON_MERGE_PATCH(credentials,%s) "
+                    "WHERE platform=%s AND account_name=%s AND credential_version=%s AND id=%s",
+                    (json.dumps({"supported_models": models, "models_updated_at": updated_at}, ensure_ascii=False),
+                     platform, name, expected_version, account_id),
+                )
+                return cursor.rowcount == 1
+
+    def update_account_cookie(self, platform: str, name: str, patch: dict,
+                              expected_version: int, account_id: int) -> bool:
+        """人工恢复同时保存新 Cookie 和健康状态，版本条件保护后台续期的新凭证。"""
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE ai_proxy_account SET credentials=JSON_MERGE_PATCH(credentials,%s), "
+                    "credential_version=credential_version+1,status='active',cooldown_until=0,"
+                    "failure_count=0,error_message='' WHERE platform=%s AND account_name=%s "
+                    "AND credential_version=%s AND id=%s",
+                    (json.dumps(patch, ensure_ascii=False), platform, name, expected_version, account_id),
+                )
+                return cursor.rowcount == 1
+
+    def bind_account_proxy(self, platform: str, name: str, proxy_id: int | None) -> dict[str, Any] | None:
+        """代理变更也更新身份版本，阻止旧出口上的刷新覆盖新绑定。"""
+        node = self.get_proxy_node(proxy_id) if proxy_id else None
+        if proxy_id and (not node or node["status"] != "active"):
+            raise ValueError("Proxy node not found or disabled")
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE ai_proxy_account SET proxy=%s,proxy_id=%s,credential_version=credential_version+1 "
+                    "WHERE platform=%s AND account_name=%s",
+                    (node["proxy_url"] if node else "", proxy_id, platform, name),
+                )
+        rows = self.list_accounts(platform, name)
+        return rows[0] if rows else None
+
+    def list_accounts(self, platform: str, name: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cursor:
+                sql = """SELECT a.id AS account_id,a.account_name,a.credentials,a.credential_version,a.proxy,a.proxy_id,a.status,a.cooldown_until,a.failure_count,a.error_message,
                     n.proxy_url AS bound_proxy, n.status AS proxy_status FROM ai_proxy_account a LEFT JOIN ai_proxy_node n ON n.id=a.proxy_id
-                    WHERE a.platform=%s""", (platform,))
+                    WHERE a.platform=%s"""
+                if name is not None:
+                    sql += " AND a.account_name=%s"
+                cursor.execute(sql, (platform, name) if name is not None else (platform,))
                 rows = cursor.fetchall()
         result = []
         for row in rows:
@@ -162,14 +233,16 @@ class Database:
             credentials = json.loads(row["credentials"]) if isinstance(row["credentials"], str) else row["credentials"]
             # 已绑定节点以节点表为准；旧 proxy 列仅供尚未迁移的账号使用。
             proxy = row["bound_proxy"] if row["proxy_id"] else row["proxy"]
-            credentials.update({"name" if platform != "gpt" else "email": row["account_name"], "proxy": proxy, "proxy_id": row["proxy_id"], "proxy_status": row["proxy_status"], "status": row["status"], "cooldown_until": row["cooldown_until"], "failure_count": row["failure_count"], "error_message": row["error_message"]})
+            credentials.update({"account_id": row["account_id"], "name" if platform != "gpt" else "email": row["account_name"], "credential_version": row.get("credential_version", 0), "proxy": proxy, "proxy_id": row["proxy_id"], "proxy_status": row["proxy_status"], "status": row["status"], "cooldown_until": row["cooldown_until"], "failure_count": row["failure_count"], "error_message": row["error_message"]})
             result.append(credentials)
         return result
 
-    def delete_account(self, platform: str, name: str) -> None:
+    def delete_account(self, platform: str, name: str, account_id: int, expected_version: int) -> bool:
         with self._connect() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM ai_proxy_account WHERE platform=%s AND account_name=%s", (platform, name))
+                cursor.execute("DELETE FROM ai_proxy_account WHERE platform=%s AND account_name=%s AND id=%s AND credential_version=%s",
+                               (platform, name, account_id, expected_version))
+                return cursor.rowcount == 1
 
 
 database = Database()

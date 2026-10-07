@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from core.account_pool import BaseAccountPool
+from core.account_pool import BaseAccountPool, serialized_account_edit
 from providers.doubao.backend import DoubaoBackendAPI
 from utils.helper import parse_cookie_string
 
@@ -30,6 +30,7 @@ class DoubaoAccountPool(BaseAccountPool):
         account.setdefault("web_id", backend.web_id)
         account.setdefault("fp", backend.fp)
 
+    @serialized_account_edit
     def add_account(self, name: str, cookie: str, proxy: str = "", proxy_id: int | None = None) -> dict[str, Any]:
         cookies = parse_cookie_string(cookie)
         if not cookies.get("sessionid"):
@@ -52,28 +53,15 @@ class DoubaoAccountPool(BaseAccountPool):
             previous = self._accounts.get(account["name"], {})
             for field in ("device_id", "web_id", "fp"):
                 account[field] = previous.get(field, account[field])
-            self._accounts[account["name"]] = account
-            self._save(account["name"])
-            self._condition.notify_all()
-        return account
+        return self._register_account(account["name"], account)
 
+    @serialized_account_edit
     def update_cookie(self, name: str, cookie: str) -> bool:
         """更新豆包 Cookie 并保留当前代理及在途请求计数。"""
         cookies = parse_cookie_string(cookie)
         if not cookies.get("sessionid"):
             raise ValueError("Cookie 中缺少 sessionid")
-        with self._condition:
-            account = self._accounts.get(name)
-            if account is None:
-                return False
-            account["cookies"] = cookies
-            account["status"] = "active"
-            account["cooldown_until"] = 0
-            account["failure_count"] = 0
-            account["error_message"] = ""
-            self._save(name)
-            self._condition.notify_all()
-            return True
+        return self._replace_cookie_fields(name, {"cookies": cookies})
 
     # ── Hooks ──
 

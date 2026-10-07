@@ -7,12 +7,14 @@ import pytest
 
 from core.account_pool import BaseAccountPool, await_thread_result
 from core.database import Database
+from core.admission import CapacityUnavailable
 
 
 def make_pool() -> BaseAccountPool:
     """建立不连接数据库的单账号池，用于验证实际占用数。"""
     pool = BaseAccountPool.__new__(BaseAccountPool)
     pool._lock = Lock()
+    pool._management_lock = Lock()
     pool._condition = Condition(pool._lock)
     pool._data_file = None
     pool._platform = ""
@@ -23,20 +25,35 @@ def make_pool() -> BaseAccountPool:
     return pool
 
 
+def test_account_delete_database_io_is_outside_lock_and_preserves_recreated_account(monkeypatch):
+    owner = make_pool()
+    owner._platform = "gpt"
+    owner._accounts["one"].update(account_id=11, credential_version=7)
+    def delete(platform, key, account_id, version):
+        assert not owner._lock.locked()
+        assert (account_id, version) == (11, 7)
+        with owner._condition:
+            owner._accounts[key] = {"name": key, "account_id": 12, "credential_version": 0, "status": "active"}
+        return True
+    monkeypatch.setattr("core.account_pool.database.delete_account", delete)
+    assert owner.delete_account("one")
+    assert owner._accounts["one"]["account_id"] == 12
+
+
 def test_cancel_waiting_request_does_not_take_next_slot():
     async def scenario() -> None:
         pool = make_pool()
         pool.get_available_account("image")
-        waiting = Event()
-        original = pool.wait_for_available_account
+        waiting = asyncio.Event()
+        original = pool._reserve_available_account
 
-        def wait(task_type: str, cancelled: Event):
+        def reserve(task_type: str):
             waiting.set()
-            return original(task_type, cancelled)
+            return original(task_type)
 
-        pool.wait_for_available_account = wait
+        pool._reserve_available_account = reserve
         request = asyncio.create_task(pool.acquire_account("image"))
-        assert await asyncio.to_thread(waiting.wait, 1)
+        await asyncio.wait_for(waiting.wait(), 1)
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
@@ -50,22 +67,21 @@ def test_cancel_waiting_request_does_not_take_next_slot():
 def test_cancel_after_reservation_returns_abandoned_slot():
     async def scenario() -> None:
         pool = make_pool()
-        reserved = Event()
-        finish = Event()
+        reserved = asyncio.Event()
+        finish = asyncio.Event()
 
-        def wait(_task_type: str, _cancelled: Event):
-            account = pool.get_available_account("image")
+        async def prepare(account):
             reserved.set()
-            finish.wait(1)
+            await finish.wait()
             return account
 
-        pool.wait_for_available_account = wait
+        pool._prepare_account_async = prepare
         request = asyncio.create_task(pool.acquire_account("image"))
-        assert await asyncio.to_thread(reserved.wait, 1)
+        await asyncio.wait_for(reserved.wait(), 1)
+        assert pool.stats()["total_inflight_tasks"] == 1
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
-        assert pool.stats()["total_inflight_tasks"] == 1
         finish.set()
         for _ in range(50):
             if pool.stats()["total_inflight_tasks"] == 0:
@@ -73,6 +89,28 @@ def test_cancel_after_reservation_returns_abandoned_slot():
             await asyncio.sleep(0.01)
         assert pool.stats()["total_inflight_tasks"] == 0
 
+    asyncio.run(scenario())
+
+
+def test_100_account_waiters_do_not_use_executor_and_expire(monkeypatch):
+    async def scenario():
+        pool = make_pool()
+        pool.get_available_account("image")
+        loop = asyncio.get_running_loop()
+
+        def unexpected_executor(*_args, **_kwargs):
+            raise AssertionError("Account waiting must not consume an executor thread")
+
+        monkeypatch.setattr(loop, "run_in_executor", unexpected_executor)
+        deadline = loop.time() + .03
+        results = await asyncio.gather(
+            *(pool.acquire_account("image", deadline=deadline) for _ in range(100)),
+            return_exceptions=True,
+        )
+        assert all(isinstance(result, CapacityUnavailable) for result in results)
+        assert pool.stats()["total_inflight_tasks"] == 1
+        pool.release_account("one", True, task_type="image")
+        assert pool.stats()["total_inflight_tasks"] == 0
     asyncio.run(scenario())
 
 
@@ -159,7 +197,7 @@ def test_restart_loads_bound_node_url_instead_of_stale_account_url(monkeypatch):
 
         def fetchall(self):
             return [{
-                "account_name": "one", "credentials": "{}", "proxy": "http://old:8080",
+                "account_id": 11, "account_name": "one", "credentials": "{}", "proxy": "http://old:8080",
                 "proxy_id": 7, "bound_proxy": "http://new:8080", "proxy_status": "active",
                 "status": "active", "cooldown_until": 0, "failure_count": 0,
                 "error_message": "",
@@ -168,3 +206,88 @@ def test_restart_loads_bound_node_url_instead_of_stale_account_url(monkeypatch):
     db = Database()
     monkeypatch.setattr(db, "_connect", Connection)
     assert db.list_accounts("gpt")[0]["proxy"] == "http://new:8080"
+
+
+def test_old_gpt_result_cannot_change_recreated_account_identity():
+    """同名重建后，旧 401 不修改新账号健康或计数。"""
+    owner = make_pool()
+    owner._platform = "gpt"
+    current = {"email":"one", "account_id":22, "credential_version":7,
+               "status":"active", "inflight":1, "inflight_image":1, "inflight_chat":0}
+    owner._accounts["one"] = current
+    old = {**current, "account_id":11}
+    owner.release_account("one",False,"unauthorized",status_code=401,task_type="image",acquired_account=old)
+    assert current["status"] == "active"
+    assert current["inflight"] == 1
+    assert not owner._batches
+
+
+def test_old_gpt_auth_failure_releases_own_slot_without_poisoning_new_credentials():
+    """同 ID 新登录保留在途数；旧版本结果仅归还自己的占用。"""
+    owner = make_pool()
+    owner._platform = "gpt"
+    owner._save = lambda *_args: None
+    owner._classify_error = lambda *_args: "fatal"
+    current = {"email":"one", "account_id":11, "credential_version":8,
+               "status":"active", "inflight":2, "inflight_image":2, "inflight_chat":0}
+    owner._accounts["one"] = current
+    fresh = dict(current)
+    old = {**current,"credential_version":7}
+    owner.release_account("one",True,task_type="image",acquired_account=fresh)
+    owner.release_account("one",False,"unauthorized",status_code=401,task_type="image",acquired_account=old)
+    assert current["inflight"] == 0
+    assert current["status"] == "active"
+    assert current["failure_count"] == 0
+    assert not owner._batches
+
+
+def test_old_gpt_success_does_not_reactivate_new_invalid_credentials():
+    owner = make_pool()
+    owner._platform = "gpt"
+    current = {"email":"one", "account_id":11, "credential_version":8,
+               "status":"error", "inflight":1, "inflight_image":1, "inflight_chat":0}
+    owner._accounts["one"] = current
+    owner._batches["one"] = {"credential_version":7,"success":True}
+    old = {**current,"credential_version":7}
+    owner.release_account("one",True,task_type="image",acquired_account=old)
+    assert current["inflight"] == 0
+    assert current["status"] == "error"
+    assert not owner._batches
+
+
+def test_slow_health_database_does_not_block_account_dispatch(monkeypatch):
+    """冷却恢复写库尚未完成时，事件循环仍能交付账号。"""
+    async def scenario():
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+        pool = make_pool()
+        pool._platform = "gemini"
+        pool._health_executor = ThreadPoolExecutor(max_workers=1)
+        pool._accounts["one"].update(account_id=11,credential_version=3,
+                                     status="cooldown",cooldown_until=int(time.time())-1)
+        entered,release = Event(),Event()
+        writes=[]
+        def write(platform,key,state):
+            writes.append(dict(state))
+            entered.set()
+            release.wait(2)
+        def old_import(*args):
+            write("gemini","one",{})
+            return {"account_id":11,"credential_version":4}
+        monkeypatch.setattr("core.account_pool.database.save_account_health",write)
+        monkeypatch.setattr("core.account_pool.database.import_account",old_import)
+        try:
+            before=time.monotonic()
+            account=await pool.acquire_account("image")
+            assert time.monotonic()-before < .2
+            assert account["inflight"] == 1
+            assert await asyncio.to_thread(entered.wait,1)
+            assert not pool._lock.locked()
+            assert not release.is_set()
+            assert writes[0]["credential_version"] == 3
+            assert "cookie" not in writes[0]
+            assert "access_token" not in writes[0]
+        finally:
+            release.set()
+            pool._health_executor.shutdown(wait=True)
+    asyncio.run(scenario())

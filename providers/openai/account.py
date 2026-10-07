@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import secrets
 from datetime import datetime, timezone
-from threading import Event
 from typing import Any
 
 from core.account_pool import BaseAccountPool
-from providers.openai.oauth import oauth_manager, refresh_access_token
+from providers.openai.oauth import oauth_manager
+from providers.openai.credentials import GPTCredentials
+from core.database import database
+from core.blocking import run_blocking
 from utils.log import logger
 
 
@@ -19,11 +22,48 @@ class OpenAIAccountPool(BaseAccountPool):
 
     def __init__(self) -> None:
         super().__init__(platform="gpt")
+        self.credentials = GPTCredentials(self)
+        # 管理端探测使用独立小预算，不挤占业务准入，也不允许无限并发。
+        self.management_slots = asyncio.Semaphore(5)
         # 旧账号仅在首次升级时补发设备 ID，后续客户端始终复用该账号身份。
         for email, account in self._accounts.items():
             if not account.get("device_id"):
                 account["device_id"] = secrets.token_hex(16)
-                self._save(email)
+                version = account.get("credential_version", 0)
+                if database.update_credentials("gpt", email, {"device_id": account["device_id"]}, version, account["account_id"]):
+                    account["credential_version"] = version + 1
+                else:
+                    rows = database.list_accounts("gpt", email)
+                    if rows:
+                        account.update(rows[0])
+
+    async def _prepare_account_async(self, account: dict[str, Any]) -> dict[str, Any]:
+        return await self.credentials.prepare(account)
+
+    def _account_ready(self, account: dict[str, Any]) -> bool:
+        return self.credentials.ready(account)
+
+    def _account_wait_failure(self) -> Exception:
+        from providers.openai.credentials import CredentialUnavailable
+        candidates = [account for account in self._accounts.values()
+                      if account.get("status") == "active" and account.get("proxy_status") != "disabled"]
+        if candidates and not any(self.credentials.ready(account) for account in candidates):
+            return CredentialUnavailable("Account credentials are not ready for model invocation")
+        return super()._account_wait_failure()
+
+    def _save(self, account_key: str | None = None) -> None:
+        # Only enqueue here: callers may hold the account pool lock.
+        accounts = self._accounts.items() if account_key is None else (
+            ((account_key, self._accounts[account_key]),) if account_key in self._accounts else ()
+        )
+        for key, account in accounts:
+            future = self._health_executor.submit(database.save_account_health, "gpt", key, dict(account))
+            def observe(done):
+                try:
+                    done.result()
+                except Exception as exc:
+                    logger.error("GPT health persistence failed reason=%s", type(exc).__name__)
+            future.add_done_callback(observe)
 
     # ── OAuth integration ──
 
@@ -68,90 +108,68 @@ class OpenAIAccountPool(BaseAccountPool):
             "error_message": "",
         }
 
-        with self._condition:
-            previous = self._accounts.get(email, {})
-            if not proxy and not proxy_id:
-                account["proxy"] = previous.get("proxy", "")
-                account["proxy_id"] = previous.get("proxy_id")
-                account["proxy_status"] = previous.get("proxy_status")
-            account["device_id"] = previous.get("device_id") or account["device_id"]
-            self._accounts[email] = account
-            self._save(email)
-            self._condition.notify_all()
+        # 登录发布与人工删除串行；OAuth 网络交换不持有管理锁或业务池锁。
+        with self._management_lock:
+            with self._lock:
+                previous = self._accounts.get(email, {})
+                previous_id = previous.get("account_id")
+                if not proxy and not proxy_id:
+                    account["proxy"] = previous.get("proxy", "")
+                    account["proxy_id"] = previous.get("proxy_id")
+                    account["proxy_status"] = previous.get("proxy_status")
+                account["device_id"] = previous.get("device_id") or account["device_id"]
+            fields = {key: value for key, value in account.items() if key in {
+                "access_token", "refresh_token", "access_token_expires_at", "device_id", "plan_type"
+            }}
+            stored_identity = database.import_account("gpt", email, fields, account["proxy"], proxy_id=account["proxy_id"])
+            rows = database.list_accounts("gpt", email)
+            if not rows:
+                raise RuntimeError("Saved account could not be reloaded")
+            replacement = rows[0]
+            if replacement["account_id"] != stored_identity["account_id"]:
+                raise RuntimeError("Account identity changed during login persistence")
+            with self._condition:
+                current = self._accounts.get(email)
+                # 查询之后可能已有较新刷新/重建结果发布，登录的迟到快照不能回退它。
+                if current is not None and (
+                    (current["account_id"] == replacement["account_id"]
+                     and current["credential_version"] > replacement["credential_version"])
+                    or current["account_id"] not in {previous_id, replacement["account_id"]}
+                ):
+                    return dict(current)
+                account = {**(current if current is not None and current["account_id"] == replacement["account_id"] else account),
+                           **replacement}
+                self._accounts[email] = account
+                self._condition.notify_all()
+            return dict(account)
 
-        return account
+    async def refresh_account_async(self, email: str, force: bool = False) -> dict[str, Any]:
+        return await self.credentials.refresh(email, force=force)
 
-    # ── Token refresh ──
-
-    def refresh_account(self, email: str) -> dict[str, Any]:
+    async def prepare_request_account(self, account: dict[str, Any], *, allow_inactive: bool = False) -> dict[str, Any]:
+        """长调用的后续认证请求重新检查最新凭证，保持设备和出口身份一致。"""
         with self._lock:
-            account = self._accounts.get(email)
-            if not account:
-                raise ValueError(f"Account {email} not found")
-
-        try:
-            data = refresh_access_token(account["refresh_token"], account.get("proxy", ""))
-            access_token = data.get("access_token")
-            if not access_token:
-                raise RuntimeError("OAuth response did not contain access_token")
-            expires_in = int(data.get("expires_in") or 864000)
-            expires_at = int(datetime.now(timezone.utc).timestamp()) + expires_in
-            claims = self._decode_jwt(access_token)
-            plan_type = (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type", "plus")
-
-            with self._condition:
-                account["access_token"] = access_token
-                account["plan_type"] = plan_type
-                account["access_token_expires_at"] = expires_at
-                account["status"] = "active"
-                account["cooldown_until"] = 0
-                account["failure_count"] = 0
-                account["error_message"] = ""
-                self._save(email)
-                self._condition.notify_all()
-            return account
-        except Exception as exc:
-            category = self._classify_error(str(exc), getattr(exc, "status_code", None))
-            with self._condition:
-                if category == "fatal":
-                    account["status"] = "error"
-                    account["cooldown_until"] = 0
-                account["error_message"] = str(exc)
-                self._save(email)
-                self._condition.notify_all()
-            raise
-
-    # ── Override get_available_account for auto-refresh ──
-
-    def _prepare_account(self, account_copy: dict[str, Any]) -> dict[str, Any]:
-        now = int(datetime.now(timezone.utc).timestamp())
-
-        # Auto-refresh if token expires within 1 hour
-        if account_copy.get("access_token_expires_at", 0) - now < 3600:
-            try:
-                data = refresh_access_token(account_copy["refresh_token"], account_copy.get("proxy", ""))
-                new_token = data.get("access_token", "")
-                expires_in = int(data.get("expires_in") or 864000)
-                expires_at = int(datetime.now(timezone.utc).timestamp()) + expires_in
-                if new_token:
-                    with self._lock:
-                        if account_copy["email"] in self._accounts:
-                            self._accounts[account_copy["email"]]["access_token"] = new_token
-                            self._accounts[account_copy["email"]]["access_token_expires_at"] = expires_at
-                            self._save(account_copy["email"])
-                    account_copy["access_token"] = new_token
-            except Exception as exc:
-                logger.warning(f"Failed pre-refreshing token for {account_copy['email']}: {exc}")
-
-        return account_copy
-
-    def get_available_account(self, task_type: str = "chat") -> dict[str, Any]:
-        return self._prepare_account(super().get_available_account(task_type=task_type))
-
-    def wait_for_available_account(self, task_type: str = "chat", cancelled: Event | None = None) -> dict[str, Any]:
-        return self._prepare_account(super().wait_for_available_account(task_type=task_type, cancelled=cancelled))
-
-    # ── Hooks ──
+            current = self._accounts.get(account["email"])
+            if (current is None or (not allow_inactive and current.get("status") != "active")
+                    or current.get("proxy_status") == "disabled"):
+                from providers.openai.credentials import CredentialUnavailable
+                raise CredentialUnavailable("Account is no longer active")
+            current = dict(current)
+        if (current["account_id"] != account["account_id"]
+                or current.get("proxy", "") != account.get("proxy", "")
+                or current.get("device_id", "") != account.get("device_id", "")):
+            from providers.openai.credentials import CredentialUnavailable
+            raise CredentialUnavailable("Account identity changed during model execution")
+        prepared = await self.credentials.prepare(current)
+        # 刷新等待期间也可能发生删除重建或代理重绑，返回前再次校验身份。
+        if (prepared["account_id"] != account["account_id"]
+                or prepared.get("proxy", "") != account.get("proxy", "")
+                or prepared.get("device_id", "") != account.get("device_id", "")):
+            from providers.openai.credentials import CredentialUnavailable
+            raise CredentialUnavailable("Account identity changed during credential preparation")
+        # 回调按最后一次实际使用的凭证版本判断健康状态，不沿用领取时的旧令牌版本。
+        account.update(prepared)
+        return prepared
 
     def _mask_sensitive(self, account: dict[str, Any]) -> dict[str, Any]:
         if account.get("refresh_token"):
@@ -184,23 +202,27 @@ class OpenAIAccountPool(BaseAccountPool):
         except Exception:
             return {}
 
-    def get_available_models(self) -> list[dict[str, str]]:
+    async def get_available_models(self) -> list[dict[str, str]]:
         """Probe available ChatGPT models using an active account."""
         with self._lock:
             active = [
-                a for a in self._accounts.values()
+                dict(a) for a in self._accounts.values()
                 if a.get("status") == "active" and a.get("access_token")
             ]
         if not active:
             return []
-        return self._discover_models(active[0])
+        return await self._discover_models(active[0])
 
-    def _discover_models(self, account: dict[str, Any]) -> list[dict[str, str]]:
+    async def _discover_models(self, account: dict[str, Any]) -> list[dict[str, str]]:
         try:
             from providers.openai.backend import OpenAIBackendAPI
-            with OpenAIBackendAPI(account.get("access_token", ""), account.get("proxy", ""), account.get("device_id", "")) as backend:
+            async with self.management_slots, OpenAIBackendAPI(
+                account.get("access_token", ""), account.get("proxy", ""), account.get("device_id", ""),
+                credential_provider=lambda: self.prepare_request_account(account),
+            ) as backend:
+                # 模型列表读取同样不能使用过期凭证或身份已改变的账号快照。
                 path = "/backend-api/models"
-                res = backend.session.get(backend.base_url + path, headers=backend._headers(path), timeout=4)
+                res = await backend._request("GET", backend.base_url + path, headers=backend._headers(path), timeout=4)
                 if res.status_code == 200:
                     data = res.json()
                     models = data.get("models") or []
@@ -217,7 +239,7 @@ class OpenAIAccountPool(BaseAccountPool):
             logger.debug(f"Probing ChatGPT models failed: {exc}")
         return []
 
-    def refresh_supported_models(self, email: str) -> list[dict[str, str]]:
+    async def refresh_supported_models(self, email: str) -> list[dict[str, str]]:
         """Discover and persist the exact ChatGPT web model slugs for one account."""
         with self._lock:
             account = self._accounts.get(email)
@@ -225,18 +247,20 @@ class OpenAIAccountPool(BaseAccountPool):
                 raise ValueError(f"Account {email} not found")
             account_copy = dict(account)
 
-        models = self._discover_models(self._prepare_account(account_copy))
+        models = await self._discover_models(account_copy)
         if not models:
             raise RuntimeError("ChatGPT 网页端未返回可用模型")
 
-        with self._condition:
-            current = self._accounts.get(email)
-            if not current:
-                raise ValueError(f"Account {email} not found")
-            current["supported_models"] = models
-            current["models_updated_at"] = int(datetime.now(timezone.utc).timestamp())
-            self._save(email)
-            self._condition.notify_all()
+        patch = {"supported_models": models, "models_updated_at": int(datetime.now(timezone.utc).timestamp())}
+        version = account_copy.get("credential_version", 0)
+        saved = await run_blocking(database.update_supported_models, "gpt", email, models,
+                                   patch["models_updated_at"], version, account_copy["account_id"])
+        if saved:
+            with self._condition:
+                current = self._accounts.get(email)
+                if current is not None and current.get("credential_version", 0) == version and current["account_id"] == account_copy["account_id"]:
+                    current.update(patch)
+                    self._condition.notify_all()
         return models
 
 

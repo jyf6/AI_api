@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 
 from api.schemas import ProxyNodeRequest, ProxyStatusRequest
 from core.database import database
+from core.blocking import run_blocking
 
 router = APIRouter(prefix="/api/proxies", tags=["proxies"])
 
@@ -11,13 +12,13 @@ router = APIRouter(prefix="/api/proxies", tags=["proxies"])
 @router.get("")
 async def list_proxies():
     """代理 URL 含认证信息，只返回节点元数据和绑定数量。"""
-    return {"proxies": database.list_proxy_nodes()}
+    return {"proxies": await run_blocking(database.list_proxy_nodes)}
 
 
 @router.post("")
 async def create_proxy(body: ProxyNodeRequest):
     try:
-        proxy_id = database.create_proxy_node(body.name, body.proxy_url)
+        proxy_id = await run_blocking(database.create_proxy_node, body.name, body.proxy_url)
         return {"id": proxy_id, "name": body.name, "status": "active"}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -26,7 +27,7 @@ async def create_proxy(body: ProxyNodeRequest):
 @router.put("/{proxy_id}")
 async def update_proxy(proxy_id: int, body: ProxyNodeRequest):
     try:
-        if not database.update_proxy_node(proxy_id, body.name, body.proxy_url, body.status):
+        if not await run_blocking(database.update_proxy_node, proxy_id, body.name, body.proxy_url, body.status):
             raise HTTPException(status_code=404, detail="Proxy not found")
     except HTTPException:
         raise
@@ -38,7 +39,7 @@ async def update_proxy(proxy_id: int, body: ProxyNodeRequest):
     from providers.gemini.account import gemini_account_service
 
     for pool in (account_service, doubao_account_service, gemini_account_service):
-        pool.refresh_proxy_node(proxy_id, body.proxy_url, body.status)
+        await run_blocking(pool.refresh_proxy_node, proxy_id, body.proxy_url, body.status)
     with gemini_account_service._lock:
         gemini_names = [name for name, account in gemini_account_service._accounts.items()
                         if account.get("proxy_id") == proxy_id]
@@ -49,7 +50,7 @@ async def update_proxy(proxy_id: int, body: ProxyNodeRequest):
 
 @router.put("/{proxy_id}/status")
 async def update_proxy_status(proxy_id: int, body: ProxyStatusRequest):
-    if not database.update_proxy_status(proxy_id, body.status):
+    if not await run_blocking(database.update_proxy_status, proxy_id, body.status):
         raise HTTPException(status_code=404, detail="Proxy not found")
     from providers.openai.account import account_service
     from providers.doubao.account import doubao_account_service
@@ -63,7 +64,7 @@ async def update_proxy_status(proxy_id: int, body: ProxyStatusRequest):
 @router.delete("/{proxy_id}")
 async def delete_proxy(proxy_id: int):
     try:
-        if not database.delete_proxy_node(proxy_id):
+        if not await run_blocking(database.delete_proxy_node, proxy_id):
             raise HTTPException(status_code=404, detail="Proxy not found")
         return {"id": proxy_id, "status": "deleted"}
     except ValueError as exc:

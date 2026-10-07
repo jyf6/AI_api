@@ -2,6 +2,7 @@ import asyncio
 import sys
 import time
 import types
+from threading import Event
 
 from curl_cffi.requests import Cookies
 from fastapi import HTTPException
@@ -82,14 +83,19 @@ def test_verified_cookie_jar_is_stored_in_account_credentials(monkeypatch, tmp_p
     pool._accounts = {}
     pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old")
     saved = []
-    monkeypatch.setattr("core.account_pool.database.import_account", lambda *args: saved.append(args))
+    def save_account(*args):
+        saved.append(args)
+        return True
+    monkeypatch.setattr("core.account_pool.database.update_credentials", save_account)
+    monkeypatch.setattr(pool, "_save_health", lambda name: None)
+    pool._accounts["main"].update(account_id=1, credential_version=0)
     pool._platform = "gemini"
     jar = Cookies()
     jar.set("__Secure-1PSID", "psid", domain=".google.com", secure=True)
     jar.set("__Secure-1PSIDTS", "renewed", domain=".google.com", secure=True)
     jar.set("SIDCC", "extra", domain=".google.com", secure=True)
 
-    pool.merge_cookie("main", dict(jar), jar)
+    asyncio.run(pool.merge_cookie("main", dict(jar), jar))
 
     credentials = saved[-1][2]
     assert credentials["psidts"] == "renewed"
@@ -112,23 +118,80 @@ def test_failed_cookie_database_write_is_retried(monkeypatch, tmp_path):
     async def run():
         client = await pool.get_client(account)
         pool._platform = "gemini"
+        pool._accounts["main"].update(account_id=1, credential_version=0)
+        monkeypatch.setattr(pool, "_save_health", lambda name: None)
         client.cookies["__Secure-1PSIDTS"] = "renewed"
 
         def unavailable(*_args):
             raise RuntimeError("database unavailable")
 
-        monkeypatch.setattr("core.account_pool.database.import_account", unavailable)
+        monkeypatch.setattr("core.account_pool.database.update_credentials", unavailable)
         await pool.verify_refreshed_client("main", client)
         assert "main" in pool._pending_cookie_saves
 
         saved = []
-        monkeypatch.setattr("core.account_pool.database.import_account", lambda *args: saved.append(args))
-        pool._retry_pending_cookie_saves()
+        def save_account(*args):
+            saved.append(args)
+            return True
+        monkeypatch.setattr("core.account_pool.database.update_credentials", save_account)
+        await pool._retry_pending_cookie_saves()
         assert "main" not in pool._pending_cookie_saves
         assert saved[-1][2]["psidts"] == "renewed"
         await pool.close_clients()
 
     asyncio.run(run())
+
+
+def test_cookie_persistence_keeps_event_loop_and_pool_lock_available(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.account_pool.database.list_accounts", lambda *args: [])
+    pool = GeminiAccountPool()
+    pool._platform = ""
+    pool._data_file = tmp_path / "accounts.json"
+    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old")
+    pool._platform = "gemini"
+    pool._accounts["main"].update(account_id=1, credential_version=0)
+    monkeypatch.setattr(pool, "_save_health", lambda name: None)
+    entered, finish = Event(), Event()
+    def persist(*args):
+        assert not pool._lock.locked()
+        entered.set()
+        assert finish.wait(2)
+        return True
+    monkeypatch.setattr("core.account_pool.database.update_credentials", persist)
+    async def run():
+        task = asyncio.create_task(pool.merge_cookie("main", {"__Secure-1PSIDTS": "renewed"}))
+        try:
+            deadline = asyncio.get_running_loop().time() + 1
+            while not entered.is_set():
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(.001)
+            # 写库尚未结束，事件循环仍能读取池状态，锁也未被后台线程持有。
+            with pool._condition:
+                assert pool._accounts["main"]["psidts"] == "renewed"
+            assert not task.done()
+        finally:
+            finish.set()
+            await task
+        assert pool._accounts["main"]["credential_version"] == 1
+        assert not pool._pending_cookie_saves
+    asyncio.run(run())
+
+
+def test_cookie_cas_conflict_preserves_new_login_credentials(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.account_pool.database.list_accounts", lambda *args: [])
+    pool = GeminiAccountPool()
+    pool._platform = ""
+    pool._data_file = tmp_path / "accounts.json"
+    pool.add_account("main", "__Secure-1PSID=psid; __Secure-1PSIDTS=old")
+    pool._platform = "gemini"
+    pool._accounts["main"].update(account_id=1, credential_version=0)
+    replacement = dict(pool._accounts["main"], psid="new-login", psidts="new-login-ts", credential_version=2)
+    monkeypatch.setattr("core.account_pool.database.update_credentials", lambda *args: False)
+    monkeypatch.setattr("core.account_pool.database.list_accounts", lambda *args: [replacement])
+    asyncio.run(pool.merge_cookie("main", {"__Secure-1PSIDTS": "old-client-rotation"}))
+    assert pool._accounts["main"]["psidts"] == "new-login-ts"
+    assert pool._accounts["main"]["credential_version"] == 2
+    assert not pool._pending_cookie_saves
 
 
 def test_rotation_only_reports_a_new_cookie(monkeypatch, tmp_path):
@@ -376,7 +439,7 @@ def test_new_gemini_account_starts_its_refresh_client(monkeypatch):
         async def get_client(self, account):
             self.started = account["name"]
 
-        def mark_refresh_verification_failed(self, _name, _error):
+        def mark_refresh_verification_failed(self, _name, _error, **kwargs):
             raise AssertionError("valid account must not be marked unavailable")
 
     pool = FakePool()
@@ -404,7 +467,7 @@ def test_gemini_account_test_rejects_an_unauthenticated_client(monkeypatch):
         def is_auth_error(self, error):
             return "未认证" in str(error)
 
-        async def discard_client(self, _name):
+        async def discard_client(self, _name, **kwargs):
             pass
 
     class FakeBackend:

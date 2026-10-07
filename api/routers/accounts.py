@@ -10,6 +10,7 @@ from providers.openai.backend import OpenAIBackendAPI
 from providers.doubao.backend import DoubaoBackendAPI
 from providers.gemini.backend import GeminiBackendAPI
 from core.database import database
+from core.blocking import run_blocking
 from api.schemas import ProxyBindingRequest
 import time
 import asyncio
@@ -46,7 +47,7 @@ async def list_accounts():
 
 @router.delete("/api/accounts/{email}")
 async def delete_account(email: str):
-    success = account_service.delete_account(email)
+    success = await run_blocking(account_service.delete_account, email)
     if not success:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"code": 0, "message": f"Account {email} deleted"}
@@ -55,7 +56,7 @@ async def delete_account(email: str):
 @router.post("/api/accounts/{email}/refresh")
 async def refresh_account(email: str):
     try:
-        acc = account_service.refresh_account(email)
+        acc = await account_service.refresh_account_async(email, force=True)
         return {"code": 0, "message": f"Account {email} refreshed", "data": acc["email"]}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -71,16 +72,18 @@ async def test_openai_account(email: str):
         raise HTTPException(status_code=404, detail="Account not found")
     t0 = time.time()
     try:
-        def _test():
-            with OpenAIBackendAPI(access_token=account["access_token"], proxy=account.get("proxy", ""), device_id=account.get("device_id", "")) as backend:
-                return backend.chat_text(_HEALTH_CHECK_PROMPT, model="auto")
-        response = await asyncio.to_thread(_test)
+        async with account_service.management_slots, OpenAIBackendAPI(
+            access_token=account["access_token"], proxy=account.get("proxy", ""),
+            device_id=account.get("device_id", ""),
+            credential_provider=lambda: account_service.prepare_request_account(account, allow_inactive=True),
+        ) as backend:
+            response = await backend.chat_text(_HEALTH_CHECK_PROMPT, model="auto")
         _validate_health_check_response(response)
-        account_service.set_account_health(email, healthy=True)
+        account_service.set_account_health(email, healthy=True, expected_account=account)
         return {"code": 0, "message": "Account is healthy", "elapsed": f"{time.time() - t0:.2f}s"}
     except Exception as exc:
         if account_service._classify_error(str(exc), getattr(exc, "status_code", None)) == "fatal":
-            account_service.set_account_health(email, healthy=False, error=str(exc))
+            account_service.set_account_health(email, healthy=False, error=str(exc), expected_account=account)
         raise HTTPException(status_code=400, detail=f"Test failed: {exc}")
 
 
@@ -95,8 +98,8 @@ async def list_doubao_accounts():
 @router.post("/api/doubao/accounts")
 async def add_doubao_account(body: DoubaoAccountRequest):
     try:
-        proxy, proxy_id = _proxy_for_account(body.proxy_id, body.proxy)
-        account = doubao_account_service.add_account(body.name, body.cookie, proxy, proxy_id)
+        proxy, proxy_id = await run_blocking(_proxy_for_account, body.proxy_id, body.proxy)
+        account = await run_blocking(doubao_account_service.add_account, body.name, body.cookie, proxy, proxy_id)
         return {"name": account["name"], "status": account["status"]}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -105,7 +108,7 @@ async def add_doubao_account(body: DoubaoAccountRequest):
 @router.put("/api/accounts/{email}/proxy")
 async def bind_openai_proxy(email: str, body: ProxyBindingRequest):
     try:
-        if not account_service.set_account_proxy(email, body.proxy_id):
+        if not await run_blocking(account_service.set_account_proxy, email, body.proxy_id):
             raise HTTPException(status_code=404, detail="Account not found")
         return {"email": email, "proxy_id": body.proxy_id}
     except HTTPException:
@@ -118,7 +121,7 @@ async def bind_openai_proxy(email: str, body: ProxyBindingRequest):
 async def update_doubao_cookie(name: str, body: AccountCookieUpdateRequest):
     """只更新 Cookie，账号池会保留该账号原有代理节点。"""
     try:
-        if not doubao_account_service.update_cookie(name, body.cookie):
+        if not await run_blocking(doubao_account_service.update_cookie, name, body.cookie):
             raise HTTPException(status_code=404, detail="Doubao account not found")
         return {"name": name, "status": "active"}
     except HTTPException:
@@ -130,7 +133,7 @@ async def update_doubao_cookie(name: str, body: AccountCookieUpdateRequest):
 @router.put("/api/doubao/accounts/{name}/proxy")
 async def bind_doubao_proxy(name: str, body: ProxyBindingRequest):
     try:
-        if not doubao_account_service.set_account_proxy(name, body.proxy_id):
+        if not await run_blocking(doubao_account_service.set_account_proxy, name, body.proxy_id):
             raise HTTPException(status_code=404, detail="Doubao account not found")
         return {"name": name, "proxy_id": body.proxy_id}
     except HTTPException:
@@ -141,7 +144,7 @@ async def bind_doubao_proxy(name: str, body: ProxyBindingRequest):
 
 @router.delete("/api/doubao/accounts/{name}")
 async def delete_doubao_account(name: str):
-    if not doubao_account_service.delete_account(name):
+    if not await run_blocking(doubao_account_service.delete_account, name):
         raise HTTPException(status_code=404, detail="Doubao account not found")
     return {"status": "deleted"}
 
@@ -164,11 +167,11 @@ async def test_doubao_account(name: str):
         async with DoubaoBackendAPI(account["cookies"], account.get("proxy", ""), account.get("device_id"), account.get("web_id"), account.get("fp")) as backend:
             response = await backend.chat(_HEALTH_CHECK_PROMPT)
         _validate_health_check_response(response)
-        doubao_account_service.set_account_health(name, healthy=True)
+        doubao_account_service.set_account_health(name, healthy=True, expected_account=account)
         return {"code": 0, "message": "Account is healthy", "elapsed": f"{time.time() - t0:.2f}s"}
     except Exception as exc:
         if doubao_account_service._classify_error(str(exc), getattr(exc, "status_code", None)) == "fatal":
-            doubao_account_service.set_account_health(name, healthy=False, error=str(exc))
+            doubao_account_service.set_account_health(name, healthy=False, error=str(exc), expected_account=account)
         raise HTTPException(status_code=400, detail=f"Test failed: {exc}")
 
 
@@ -184,14 +187,14 @@ async def list_gemini_accounts():
 async def add_gemini_account(body: GeminiAccountRequest):
     try:
         await gemini_account_service.discard_client(body.name.strip())
-        proxy, proxy_id = _proxy_for_account(body.proxy_id, body.proxy)
-        account = gemini_account_service.add_account(body.name, body.cookie, proxy, proxy_id)
+        proxy, proxy_id = await run_blocking(_proxy_for_account, body.proxy_id, body.proxy)
+        account = await run_blocking(gemini_account_service.add_account, body.name, body.cookie, proxy, proxy_id)
         # 新录入 Cookie 立即建立账号级客户端；成功后自动续期任务才会常驻。
         await gemini_account_service.get_client(account)
         return {"name": account["name"], "status": account["status"]}
     except Exception as exc:
         if "account" in locals():
-            gemini_account_service.mark_refresh_verification_failed(account["name"], exc)
+            gemini_account_service.mark_refresh_verification_failed(account["name"], exc, expected_account=account)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -200,7 +203,7 @@ async def update_gemini_cookie(name: str, body: AccountCookieUpdateRequest):
     """替换 Gemini Cookie、清理旧客户端，并保留数据库中的代理节点。"""
     try:
         await gemini_account_service.discard_client(name)
-        if not gemini_account_service.update_cookie(name, body.cookie):
+        if not await run_blocking(gemini_account_service.update_cookie, name, body.cookie):
             raise HTTPException(status_code=404, detail="Gemini account not found")
         return {"name": name, "status": "active"}
     except HTTPException:
@@ -213,7 +216,7 @@ async def update_gemini_cookie(name: str, body: AccountCookieUpdateRequest):
 async def bind_gemini_proxy(name: str, body: ProxyBindingRequest):
     try:
         await gemini_account_service.discard_client(name)
-        if not gemini_account_service.set_account_proxy(name, body.proxy_id):
+        if not await run_blocking(gemini_account_service.set_account_proxy, name, body.proxy_id):
             raise HTTPException(status_code=404, detail="Gemini account not found")
         return {"name": name, "proxy_id": body.proxy_id}
     except HTTPException:
@@ -224,7 +227,7 @@ async def bind_gemini_proxy(name: str, body: ProxyBindingRequest):
 
 @router.delete("/api/gemini/accounts/{name}")
 async def delete_gemini_account(name: str):
-    if not gemini_account_service.delete_account(name):
+    if not await run_blocking(gemini_account_service.delete_account, name):
         raise HTTPException(status_code=404, detail="Gemini account not found")
     await gemini_account_service.discard_client(name)
     return {"status": "deleted"}
@@ -248,10 +251,10 @@ async def test_gemini_account(name: str):
         async with GeminiBackendAPI(account) as backend:
             result = await backend.client.generate_content(_HEALTH_CHECK_PROMPT, temporary=True)
             _validate_health_check_response(result.text)
-        gemini_account_service.set_account_health(name, healthy=True)
+        gemini_account_service.set_account_health(name, healthy=True, expected_account=account)
         return {"code": 0, "message": "Gemini text connectivity test passed", "elapsed": f"{time.time() - t0:.2f}s"}
     except Exception as exc:
         if gemini_account_service.is_auth_error(exc):
-            await gemini_account_service.discard_client(name)
-            gemini_account_service.set_account_health(name, healthy=False, error=str(exc))
+            await gemini_account_service.discard_client(name, expected_account=account)
+            gemini_account_service.set_account_health(name, healthy=False, error=str(exc), expected_account=account)
         raise HTTPException(status_code=400, detail=f"Test failed: {exc}")

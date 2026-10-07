@@ -5,11 +5,14 @@ import json
 import time
 from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from threading import Condition, Event, Lock
 from typing import Any, Callable, TypeVar
 
 from utils.log import logger, proxy_log_ref, stable_log_ref
 from core.database import database
+from core.admission import CapacityUnavailable, current_permit
 
 
 class AccountWaitCancelled(Exception):
@@ -17,6 +20,15 @@ class AccountWaitCancelled(Exception):
 
 
 T = TypeVar("T")
+
+
+def serialized_account_edit(method):
+    """人工修改彼此串行；这把锁不参与业务派单，数据库慢时账号池仍可调度。"""
+    @wraps(method)
+    def edit(self, *args, **kwargs):
+        with self._management_lock:
+            return method(self, *args, **kwargs)
+    return edit
 
 
 async def await_thread_result(call: Callable[[], T]) -> T:
@@ -50,13 +62,83 @@ class BaseAccountPool:
     def __init__(self, data_file: Path | None = None, platform: str = "") -> None:
         self._lock = Lock()
         self._condition = Condition(self._lock)
+        self._management_lock = Lock()
         self._data_file = data_file
         self._platform = platform
         self._accounts: dict[str, dict[str, Any]] = self._load()
+        self._health_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{platform}-health")
         # 同一账号当前并发批次的结果只放内存；账号健康状态在批次收敛时持久化。
         self._batches: dict[str, dict[str, Any]] = {}
 
     # ── Persistence ──
+
+    def _persist_account_snapshot(self, key: str, snapshot: dict) -> dict:
+        """只保存调用方快照，不访问实时账号池；调用方在池锁外执行。"""
+        account = dict(snapshot)
+        if not self._platform:
+            return account
+        if account.get("proxy") and not account.get("proxy_id"):
+            proxy_id = database.ensure_proxy_node(account["proxy"])
+            node = database.get_proxy_node(proxy_id)
+            account.update(proxy_id=proxy_id, proxy_status=node["status"])
+        credentials = {k: v for k, v in account.items() if k not in {
+            "account_id", "name", "email", "proxy", "proxy_id", "proxy_status", "status",
+            "credential_version", "credential_pending", "inflight", "inflight_image", "inflight_chat",
+            "last_used_at", "last_dispatched_at", "cooldown_until", "failure_count", "error_message"
+        }}
+        account.update(database.import_account(
+            self._platform, key, credentials, account.get("proxy", ""), account["status"],
+            int(account.get("cooldown_until", 0)), int(account.get("failure_count", 0)),
+            account.get("error_message", ""), account.get("proxy_id")
+        ))
+        return account
+
+    def _register_account(self, key: str, snapshot: dict) -> dict:
+        """人工录入先持久化，再发布；同身份现有在途计数不随重新登录归零。"""
+        stored = self._persist_account_snapshot(key, snapshot)
+        with self._condition:
+            current = self._accounts.get(key)
+            if (current is not None and current.get("account_id") == stored.get("account_id")
+                    and current.get("credential_version", 0) > stored.get("credential_version", 0)):
+                return dict(current)
+            if current is not None and current.get("account_id") == stored.get("account_id"):
+                for field in ("inflight", "inflight_image", "inflight_chat", "last_used_at", "last_dispatched_at"):
+                    if field in current:
+                        stored[field] = current[field]
+            self._accounts[key] = stored
+            self._condition.notify_all()
+        if not self._platform:
+            self._save()
+        return stored
+
+    def _replace_cookie_fields(self, key: str, fields: dict) -> bool:
+        """人工 Cookie 更新按读取时的身份版本保存，后台续期抢先更新时要求重试。"""
+        with self._condition:
+            current = self._accounts.get(key)
+            if current is None:
+                return False
+            snapshot = dict(current)
+        if self._platform and not database.update_account_cookie(
+            self._platform, key, fields, snapshot["credential_version"], snapshot["account_id"]
+        ):
+            raise RuntimeError("账号凭证已被并发更新，请重试")
+        with self._condition:
+            current = self._accounts.get(key)
+            if (self._platform and current is not None and current["account_id"] == snapshot["account_id"]
+                    and current["credential_version"] == snapshot["credential_version"] + 1
+                    and all(current.get(field) == value for field, value in fields.items())):
+                # 后台 CAS 冲突重载可能已经发布了本次人工写入，不重复推进版本。
+                return True
+            if current is None or any(current.get(field) != snapshot.get(field)
+                                      for field in ("account_id", "credential_version")):
+                raise RuntimeError("账号身份已被并发更新，请重试")
+            current.update(fields, status="active", cooldown_until=0, failure_count=0, error_message="")
+            if self._platform:
+                current["credential_version"] += 1
+            self._condition.notify_all()
+        if not self._platform:
+            self._save()
+        return True
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if self._platform:
@@ -94,25 +176,7 @@ class BaseAccountPool:
             else:
                 return
             for key, account in accounts:
-                if account.get("proxy") and not account.get("proxy_id"):
-                    proxy_id = database.ensure_proxy_node(account["proxy"])
-                    node = database.get_proxy_node(proxy_id)
-                    account["proxy_id"] = proxy_id
-                    account["proxy_status"] = node["status"]
-                credentials = {
-                    k: v for k, v in account.items()
-                    if k not in {
-                        "name", "email", "proxy", "proxy_id", "proxy_status", "status",
-                        "inflight", "inflight_image", "inflight_chat",
-                        "last_used_at", "last_dispatched_at", "cooldown_until", "failure_count", "error_message"
-                    }
-                }
-                database.import_account(
-                    self._platform, key, credentials,
-                    account.get("proxy", ""), account.get("status", "active"),
-                    int(account.get("cooldown_until", 0)), int(account.get("failure_count", 0)),
-                    account.get("error_message", ""), account.get("proxy_id")
-                )
+                account.update(self._persist_account_snapshot(key, account))
             return
         if self._data_file is None:
             return
@@ -124,50 +188,74 @@ class BaseAccountPool:
         except Exception as exc:
             logger.error(f"Failed to save {self._data_file.name}: {exc}")
 
+    def _save_health(self, key: str) -> None:
+        """只提交健康字段的快照；数据库线程不持有账号池锁，也不回写 Cookie。"""
+        if self._platform == "gpt" or not self._platform:
+            self._save(key)
+            return
+        account = self._accounts[key]
+        state = {field: account.get(field, 0) for field in
+                 ("account_id", "credential_version", "cooldown_until", "failure_count")}
+        state.update(status=account["status"], error_message=account.get("error_message", ""))
+        future = self._health_executor.submit(database.save_account_health, self._platform, key, state)
+        def observe(done):
+            try:
+                done.result()
+            except Exception as exc:
+                logger.error("Account health persistence failed platform=%s account_ref=%s reason=%s",
+                             self._platform, stable_log_ref(f"{self._platform}-account", key), type(exc).__name__)
+        future.add_done_callback(observe)
+
     # ── CRUD ──
 
+    @serialized_account_edit
     def delete_account(self, key: str) -> bool:
-        with self._lock:
+        with self._condition:
             if key not in self._accounts:
                 return False
-            del self._accounts[key]
-            self._batches.pop(key, None)
-            if self._platform:
-                database.delete_account(self._platform, key)
-            elif self._data_file is not None:
-                self._save()
-            return True
+            snapshot = dict(self._accounts[key])
+        # 删除的数据库 I/O 在锁外；并发重新登录或刷新后的身份不能被旧删除覆盖。
+        if self._platform and not database.delete_account(
+            self._platform, key, snapshot["account_id"], snapshot["credential_version"]
+        ):
+            return False
+        with self._condition:
+            current = self._accounts.get(key)
+            if current is not None and all(current.get(field) == snapshot.get(field)
+                                           for field in ("account_id", "credential_version")):
+                del self._accounts[key]
+                self._batches.pop(key, None)
+                self._condition.notify_all()
+        if not self._platform and self._data_file is not None:
+            self._save()
+        return True
 
+    @serialized_account_edit
     def set_account_proxy(self, key: str, proxy_id: int | None) -> bool:
         """固定或清除账号的代理绑定，并立即更新运行时账号。"""
+        replacement = database.bind_account_proxy(self._platform, key, proxy_id)
+        if replacement is None:
+            return False
         with self._condition:
-            account = self._accounts.get(key)
-            if account is None:
+            current = self._accounts.get(key)
+            if current is None or current["account_id"] != replacement["account_id"]:
                 return False
-            if proxy_id:
-                node = database.get_proxy_node(proxy_id)
-                if not node:
-                    raise ValueError(f"Proxy node {proxy_id} not found")
-                if node["status"] != "active":
-                    raise ValueError("不能将账号绑定到已停用的代理")
-                account["proxy"] = node["proxy_url"]
-                account["proxy_status"] = node["status"]
-                account["proxy_id"] = proxy_id
-            else:
-                account["proxy"] = ""
-                account["proxy_status"] = None
-                account["proxy_id"] = None
-            self._save(key)
+            if current["credential_version"] <= replacement["credential_version"]:
+                current.update(replacement)
             self._condition.notify_all()
             return True
 
     def refresh_proxy_node(self, proxy_id: int, proxy_url: str, status: str) -> None:
         """同步运行中的账号所绑定节点的最新地址和启停状态。"""
+        rows = database.list_accounts(self._platform)
         with self._condition:
-            for account in self._accounts.values():
-                if account.get("proxy_id") == proxy_id:
-                    account["proxy"] = proxy_url
-                    account["proxy_status"] = status
+            for replacement in rows:
+                key = replacement.get("email") or replacement.get("name")
+                account = self._accounts.get(key)
+                if (account is not None and replacement.get("proxy_id") == proxy_id
+                        and account["account_id"] == replacement["account_id"]
+                        and account["credential_version"] <= replacement["credential_version"]):
+                    account.update(replacement)
             self._condition.notify_all()
 
     def refresh_proxy_status(self, proxy_id: int, status: str) -> None:
@@ -178,11 +266,17 @@ class BaseAccountPool:
                     account["proxy_status"] = status
             self._condition.notify_all()
 
-    def set_account_health(self, key: str, healthy: bool, error: str = "") -> None:
+    def set_account_health(self, key: str, healthy: bool, error: str = "", *, expected_account: dict | None = None) -> None:
         """Update verified account health without changing task in-flight counters."""
         with self._condition:
             account = self._accounts.get(key)
             if not account:
+                return
+            # GPT 管理端探测结束时可能已重新登录；旧探测不能修改新身份的健康状态。
+            if expected_account is not None and any(
+                account.get(field) != expected_account.get(field)
+                for field in ("account_id", "credential_version")
+            ):
                 return
             if healthy:
                 account["status"] = "active"
@@ -200,7 +294,7 @@ class BaseAccountPool:
                 logger.warning("event=account_health_verification_failed platform=%s account_ref=%s reason=%s",
                                self._platform, stable_log_ref(f"{self._platform}-account", key),
                                "verification_failed")
-            self._save(key)
+            self._save_health(key)
             self._condition.notify_all()
 
     def list_accounts(self) -> list[dict[str, Any]]:
@@ -232,7 +326,7 @@ class BaseAccountPool:
                 restored_keys.append(key)
         if restored_keys:
             for key in restored_keys:
-                self._save(key)
+                self._save_health(key)
             self._condition.notify_all()
 
     # ── Scheduling ──
@@ -304,30 +398,52 @@ class BaseAccountPool:
                 timeout = max(0.01, min(deadlines) - now) if deadlines else None
                 self._condition.wait(timeout)
 
-    async def acquire_account(self, task_type: str = "chat") -> dict[str, Any]:
-        """异步等待账号；取消后回收与取消同时完成的预订。"""
-        cancelled = Event()
-        waiter = asyncio.create_task(asyncio.to_thread(self.wait_for_available_account, task_type, cancelled))
+    async def acquire_account(self, task_type: str = "chat", deadline: float | None = None) -> dict[str, Any]:
+        """Wait without blocking a worker thread; reservation and cancellation cannot interleave."""
+        loop = asyncio.get_running_loop()
+        permit = current_permit.get()
+        if deadline is None:
+            deadline = permit.deadline if permit is not None and not permit.upstream_started else loop.time() + 30
+        if permit is not None:
+            await permit.begin_account_wait()
         try:
-            return await asyncio.shield(waiter)
-        except asyncio.CancelledError:
-            cancelled.set()
-            with self._condition:
-                self._condition.notify_all()
+            while True:
+                if loop.time() >= deadline:
+                    with self._condition:
+                        failure = self._account_wait_failure()
+                    raise failure
+                if permit is not None:
+                    await permit.ensure_reserved(deadline)
+                with self._condition:
+                    account = self._reserve_available_account(task_type)
+                    healthy = any(
+                        candidate.get("status") in {"active", "cooldown"}
+                        and candidate.get("proxy_status") != "disabled"
+                        for candidate in self._accounts.values()
+                    )
+                if account is not None:
+                    try:
+                        return await self._prepare_account_async(account)
+                    except BaseException:
+                        self.release_account(account.get("name") or account.get("email"), False, task_type=task_type, acquired_account=account)
+                        raise
+                if not healthy:
+                    raise CapacityUnavailable("NO_HEALTHY_ACCOUNT")
+                if permit is not None:
+                    await permit.park_for_account()
+                # Account dispatch intervals and cooldowns can expire without a release event.
+                await asyncio.sleep(min(.05, max(0, deadline - loop.time())))
+        finally:
+            if permit is not None:
+                await permit.end_account_wait()
 
-            def release_abandoned(done: asyncio.Task) -> None:
-                try:
-                    account = done.result()
-                except AccountWaitCancelled:
-                    return
-                except Exception as exc:
-                    logger.warning("取消后的账号等待结束异常 platform=%s reason=%s", self._platform, type(exc).__name__)
-                    return
-                key = account.get("name") or account.get("email")
-                self.release_account(key, False, task_type=task_type)
+    def _account_wait_failure(self) -> Exception:
+        """普通账号忙返回容量错误；平台可区分自己的凭证准备失败。"""
+        return CapacityUnavailable()
 
-            waiter.add_done_callback(release_abandoned)
-            raise
+
+    async def _prepare_account_async(self, account: dict[str, Any]) -> dict[str, Any]:
+        return account
 
     def release_account(
         self,
@@ -338,6 +454,7 @@ class BaseAccountPool:
         retry_after: int | None = None,
         task_type: str = "chat",
         failure_scope: str = "account",
+        acquired_account: dict[str, Any] | None = None,
     ) -> None:
         """释放单次请求；普通故障在当前并发批次全部结束后才判定账号健康。"""
         norm_type = "image" if task_type == "image" else "chat"
@@ -345,6 +462,16 @@ class BaseAccountPool:
             account = self._accounts.get(key)
             if not account:
                 return
+
+            # 删除重建后的同名账号不承接旧身份的计数；同 ID 新凭证仍承接旧在途。
+            if self._platform and acquired_account is not None:
+                if account["account_id"] != acquired_account["account_id"]:
+                    return
+                if account["credential_version"] != acquired_account["credential_version"]:
+                    success, error = False, ""
+                batch = self._batches.get(key)
+                if batch is not None and batch.get("credential_version") != account["credential_version"]:
+                    self._batches.pop(key)
 
             previous_health = (
                 account.get("status"), account.get("cooldown_until", 0),
@@ -354,6 +481,8 @@ class BaseAccountPool:
             account[f"inflight_{norm_type}"] = max(0, account.get(f"inflight_{norm_type}", 1) - 1)
             account["inflight"] = account.get("inflight_image", 0) + account.get("inflight_chat", 0)
             batch = self._batches.setdefault(key, {"success": False, "failures": 0, "probing": False, "explicit": False, "error": ""})
+            if self._platform and acquired_account is not None:
+                batch["credential_version"] = account["credential_version"]
             if success:
                 batch["success"] = True
             elif error:
@@ -369,7 +498,7 @@ class BaseAccountPool:
                     account["error_message"] = error[:500]
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
-                    self._save(key)
+                    self._save_health(key)
                     logger.error("event=account_marked_error platform=%s account_ref=%s status_code=%s",
                                  self._platform, stable_log_ref(f"{self._platform}-account", key), status_code)
                 elif category == "rate_limit":
@@ -378,14 +507,22 @@ class BaseAccountPool:
                     account["error_message"] = error[:500]
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
-                    self._save(key)
+                    self._save_health(key)
                     logger.warning("event=account_rate_limited platform=%s account_ref=%s status_code=%s cooldown_seconds=%d",
                                    self._platform, stable_log_ref(f"{self._platform}-account", key), status_code,
                                    retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
                 elif failure_scope == "transport":
                     batch["probing"] = True
                     if account.get("proxy_id"):
-                        database.record_proxy_failure(account["proxy_id"])
+                        future = self._health_executor.submit(database.record_proxy_failure, account["proxy_id"])
+                        def observe_proxy_failure(done):
+                            # 后台记录失败必须可见，日志不包含代理地址或认证信息。
+                            try:
+                                done.result()
+                            except Exception as exc:
+                                logger.error("Proxy failure persistence failed platform=%s reason=%s",
+                                             self._platform, type(exc).__name__)
+                        future.add_done_callback(observe_proxy_failure)
                     logger.warning("event=proxy_transport_failure platform=%s account_ref=%s proxy_ref=%s status_code=%s",
                                    self._platform, stable_log_ref(f"{self._platform}-account", key),
                                    proxy_log_ref(account), status_code)
@@ -413,7 +550,7 @@ class BaseAccountPool:
                         account.get("failure_count", 0), account.get("error_message", ""),
                     )
                     if current_health != previous_health:
-                        self._save(key)
+                        self._save_health(key)
                         if account.get("status") == "active" and batch["success"]:
                             logger.info("event=account_recovered platform=%s account_ref=%s",
                                         self._platform, stable_log_ref(f"{self._platform}-account", key))

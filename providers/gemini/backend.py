@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.admission import mark_model_request_started
 
 import asyncio
 import contextlib
@@ -92,8 +93,26 @@ def _detect_image_suffix(data: bytes) -> str:
 
 
 def _read_image_source(source: str) -> tuple[bytes, str]:
-    """使用统一的 OSS objectKey 读取私有参考图。"""
+    """使用统一的 OSS objectKey 读取私有参考图，并对超过 1MB 的大图转 JPEG 压缩以降低跨境上传耗时。"""
     raw = read_oss_reference(source)
+    if len(raw) > 1024 * 1024:
+        try:
+            from PIL import Image
+            img = Image.open(io.BytesIO(raw))
+            max_dim = max(img.width, img.height)
+            if max_dim > 2048:
+                scale = 2048.0 / max_dim
+                img = img.resize(
+                    (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            raw = buf.getvalue()
+        except Exception:
+            pass
     if image_media_type(raw) is None:
         raise RuntimeError("Gemini reference download did not return a valid image")
     ext = _detect_image_suffix(raw[:16])
@@ -105,10 +124,15 @@ def _create_reference_images(sources: list[str]):
     """Keep reference images in memory with names that preserve their media types."""
     images: list[io.BytesIO] = []
     try:
-        for src in sources:
-            if not src:
-                continue
-            raw_bytes, ext = _read_image_source(str(src))
+        valid_sources = [str(src) for src in sources if src]
+        # 多张参考图并发从 OSS 拉取并压缩，避免单线程串行拉取耗时过长
+        if len(valid_sources) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, len(valid_sources))) as pool:
+                loaded = list(pool.map(_read_image_source, valid_sources))
+        else:
+            loaded = [_read_image_source(src) for src in valid_sources]
+        for raw_bytes, ext in loaded:
             image = io.BytesIO(raw_bytes)
             image.name = f"reference_{len(images) + 1}{ext}"
             images.append(image)
@@ -180,17 +204,18 @@ class GeminiBackendAPI:
         image_sources = images or []
         client_model = None if model == "auto" else model
         async with _prepare_reference_images(image_sources) as images:
+            await mark_model_request_started()
             stream = self.client.generate_content_stream(prompt, files=images or None, model=client_model)
             text = ""
             try:
                 while True:
-                    # 首段文本最多等待 20 秒；已有文本后，空闲 6 秒即使用现有结果返回。
+                    # 首段文本包含多图上传与模型预填充，最多等待 120 秒；已有文本后，空闲 6 秒即使用现有结果返回。
                     try:
-                        output = await asyncio.wait_for(anext(stream), timeout=6 if text else 20)
+                        output = await asyncio.wait_for(anext(stream), timeout=6 if text else 120)
                     except TimeoutError:
                         if text:
                             return text.strip()
-                        raise RuntimeError("Gemini did not return text within 20 seconds")
+                        raise RuntimeError("Gemini did not return text within 120 seconds") from None
 
                     current_text = output.candidates[output.chosen].text if output.candidates else ""
                     text = current_text or getattr(output, "text", "") or text
@@ -229,6 +254,7 @@ class GeminiBackendAPI:
         client_model = None if model == "auto" else model
         try:
             async with _prepare_reference_images(references or []) as images:
+                await mark_model_request_started()
                 stream = self.client.generate_content_stream(
                     prompt, files=images or None, model=client_model
                 )

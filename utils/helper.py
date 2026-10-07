@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from typing import Any, Iterator
+from typing import Any, Iterator, AsyncIterator
 from curl_cffi import requests
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
@@ -90,6 +90,29 @@ def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
         payload = line[5:].strip()
         if payload:
             yield payload
+
+
+async def aiter_sse_payloads(response: requests.Response) -> AsyncIterator[str]:
+    """按完整 SSE 事件解析；跨网络块的行与多行 data 均保留。"""
+    import codecs
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    data_lines: list[str] = []
+    async for chunk in response.aiter_content():
+        pending += decoder.decode(chunk)
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            line = line.removesuffix("\r")
+            if not line:
+                if data_lines:
+                    yield "\n".join(data_lines)
+                    data_lines.clear()
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].removeprefix(" "))
+    pending += decoder.decode(b"", final=True)
+    # 未闭合事件表示正文截断，不能把它当作正常完成。
+    if pending or data_lines:
+        raise RuntimeError("Upstream SSE ended in an incomplete event")
 
 
 def parse_cookie_string(raw: str) -> dict[str, str]:

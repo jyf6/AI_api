@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.admission import mark_model_request_started
 import asyncio
 
 import hashlib
@@ -179,6 +180,7 @@ class DoubaoBackendAPI:
         url = self.BASE_URL + "/samantha/chat/completion"
         headers = {"Accept": "text/event-stream", "Content-Type": "application/json",
                    "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
+        await mark_model_request_started()
         response = await self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers)
         if response.status_code != 200:
             raise RuntimeError(f"Doubao chat failed ({response.status_code}): {response.text[:300]}")
@@ -218,6 +220,7 @@ class DoubaoBackendAPI:
         url = self.BASE_URL + "/samantha/chat/completion"
         headers = {"Accept": "text/event-stream", "Content-Type": "application/json",
                    "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
+        await mark_model_request_started()
         response = await self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers)
         if response.status_code != 200:
             raise RuntimeError(f"Doubao image failed ({response.status_code}): {response.text[:300]}")

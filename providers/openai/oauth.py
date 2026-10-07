@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import re
 import time
 from threading import Lock
 from typing import Any
@@ -130,11 +131,18 @@ class OAuthManager:
         return resp.json()
 
 
-def refresh_access_token(refresh_token: str, proxy: str = "") -> dict[str, Any]:
+class OAuthRefreshError(RuntimeError):
+    def __init__(self, status_code: int, error_code: str):
+        self.status_code = status_code
+        self.error_code = error_code if re.fullmatch(r"[a-zA-Z0-9_]{1,64}", error_code) else "oauth_error"
+        super().__init__(f"OAuth refresh failed status={status_code} code={self.error_code}")
+
+
+async def refresh_access_token(refresh_token: str, proxy: str = "") -> dict[str, Any]:
     """Use refresh_token to get a new access_token via the account's bound proxy."""
     proxy = proxy.strip()
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    session = requests.Session(impersonate="chrome124", proxies=proxies)
+    session = requests.AsyncSession(impersonate="chrome124", proxies=proxies)
 
     token_url = f"{AUTH_BASE}/oauth/token"
     headers = {
@@ -148,12 +156,18 @@ def refresh_access_token(refresh_token: str, proxy: str = "") -> dict[str, Any]:
     }
 
     try:
-        response = session.post(token_url, headers=headers, json=payload, timeout=30)
+        response = await session.post(token_url, headers=headers, json=payload, timeout=30)
     finally:
-        session.close()
+        await session.close()
 
     if response.status_code != 200:
-        raise RuntimeError(f"OAuth refresh failed ({response.status_code}): {response.text[:200]}")
+        try:
+            error_code = (response.json().get("error") or "oauth_error")
+            if isinstance(error_code, dict):
+                error_code = error_code.get("code", "oauth_error")
+        except Exception:
+            error_code = "oauth_error"
+        raise OAuthRefreshError(response.status_code, str(error_code))
 
     return response.json()
 

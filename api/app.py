@@ -10,6 +10,7 @@ from redis.asyncio import Redis
 
 from api.routers import accounts, capacity, chat, edit, health, images, oauth, proxies
 from utils.log import logger
+from core.admission import initialize_model_admission
 
 CAPACITY_REDIS_PREFIX = "flexi:ai:capacity:"
 CAPACITY_SNAPSHOT_TTL_SECONDS = 4
@@ -23,11 +24,7 @@ async def publish_capacity_snapshots(redis_client: Redis) -> None:
             snapshots = capacity.get_platform_capacity_snapshots()
             pipeline = redis_client.pipeline(transaction=True)
             for platform, snapshot in snapshots.items():
-                payload = {
-                    "available_slots": snapshot["available_slots"],
-                    "total_slots": snapshot["total_slots"],
-                    "updated_at": int(time.time() * 1000),
-                }
+                payload = snapshot
                 pipeline.set(
                     f"{CAPACITY_REDIS_PREFIX}{platform}",
                     json.dumps(payload, separators=(",", ":")),
@@ -44,11 +41,20 @@ def create_app() -> FastAPI:
     async def lifespan(_app: FastAPI):
         from providers.gemini.account import gemini_account_service
 
+        initialize_model_admission()
+        from providers.openai.account import account_service
+        credential_task = asyncio.create_task(account_service.credentials.maintain())
         redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
         capacity_task = asyncio.create_task(publish_capacity_snapshots(redis_client))
         # 后台限并发预热，并持续恢复中断的续期客户端。
         warmup_task = asyncio.create_task(gemini_account_service.maintain_clients())
         yield
+        credential_task.cancel()
+        try:
+            await credential_task
+        except asyncio.CancelledError:
+            pass
+        await account_service.credentials.drain()
         warmup_task.cancel()
         try:
             await warmup_task

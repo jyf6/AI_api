@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import hashlib
 import uuid
 
@@ -7,11 +8,14 @@ import re
 import struct
 import threading
 import time
+from contextlib import aclosing
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, AsyncIterator, Optional
 from curl_cffi import requests
 
-from utils.helper import ImageQuotaExceededError, ensure_ok, iter_sse_payloads
+from utils.helper import ImageQuotaExceededError, ensure_ok, aiter_sse_payloads
+from core.blocking import run_blocking
+from core.admission import mark_model_request_started
 from utils.log import logger
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
@@ -44,7 +48,8 @@ class ChatRequirements:
 class OpenAIBackendAPI:
     """ChatGPT reverse client with per-account proxy binding and zero-storage image output."""
 
-    def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "") -> None:
+    def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "", credential_provider=None) -> None:
+        self.credential_provider = credential_provider
         self.access_token = access_token.strip()
         self.proxy = proxy.strip()
         self.base_url = "https://chatgpt.com"
@@ -60,7 +65,7 @@ class OpenAIBackendAPI:
         self.sec_ch_ua = '"Chromium";v="124", "Not:A-Brand";v="99"'
 
         proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
-        self.session = requests.Session(impersonate="chrome124", proxies=proxies)
+        self.session = requests.AsyncSession(impersonate="chrome124", proxies=proxies)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -89,17 +94,45 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build: str = ""
 
-    def close(self) -> None:
+    async def close(self) -> None:
         try:
-            self.session.close()
+            await self.session.close()
         except Exception:
             pass
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, *args):
-        self.close()
+    async def __aexit__(self, *args):
+        await self.close()
+
+    async def _request(self, method: str, url: str, **kwargs):
+        if url.startswith(self.base_url + "/"):
+            if self.credential_provider is not None:
+                account = await self.credential_provider()
+                self.access_token = account["access_token"]
+                self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                if "headers" in kwargs:
+                    headers = requests.Headers(kwargs["headers"])
+                    headers["Authorization"] = f"Bearer {self.access_token}"
+                    kwargs["headers"] = headers
+            if method == "POST" and url in {
+                self.base_url + "/backend-api/conversation", self.base_url + "/backend-api/f/conversation"
+            }:
+                await mark_model_request_started()
+        return await getattr(self.session, method.lower())(url, **kwargs)
+
+    async def _close_stream(self, response: requests.Response) -> None:
+        # curl_cffi 0.16 的 aclose 只等待传输结束；主动移除未结束的句柄，
+        # 避免已拿到图片后仍等待剩余文本流或 300 秒网络超时。
+        task = response.astream_task
+        if task is not None and not task.done():
+            self.session.acurl.remove_handle(response.curl)
+        try:
+            await response.aclose()
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
 
     def _headers(self, path: str, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
         headers = dict(self.session.headers)
@@ -109,7 +142,7 @@ class OpenAIBackendAPI:
             headers.update(extra)
         return headers
 
-    def _bootstrap(self) -> None:
+    async def _bootstrap(self) -> None:
         """Fetch homepage to extract PoW script URLs and data-build tag.
         Uses a 30-minute module-level cache to avoid redundant HTML fetches.
         """
@@ -123,7 +156,7 @@ class OpenAIBackendAPI:
                 return
 
         path = "/"
-        response = self.session.get(
+        response = await self._request("GET",
             self.base_url + path,
             headers=self._headers(path, {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}),
             timeout=30,
@@ -136,13 +169,13 @@ class OpenAIBackendAPI:
             _cache_timestamp = time.time()
             logger.debug("Bootstrap: refreshed PoW cache")
 
-    def _get_chat_requirements(self) -> ChatRequirements:
+    async def _get_chat_requirements(self) -> ChatRequirements:
         """Obtain Sentinel Token (PoW proof) required for image generation."""
         base = "/backend-api/sentinel/chat-requirements"
-        p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+        p_token = await run_blocking(build_legacy_requirements_token, self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
+        response = await self._request("POST",
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
@@ -154,7 +187,7 @@ class OpenAIBackendAPI:
         proof_token = ""
         proof_info = prepare_data.get("proofofwork") or {}
         if proof_info.get("required"):
-            proof_token = build_proof_token(
+            proof_token = await run_blocking(build_proof_token,
                 proof_info.get("seed", ""),
                 proof_info.get("difficulty", ""),
                 self.user_agent,
@@ -165,10 +198,10 @@ class OpenAIBackendAPI:
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}
         if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+            turnstile_token = await run_blocking(solve_turnstile_token, turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
+        response = await self._request("POST",
             self.base_url + finalize_path,
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
@@ -242,34 +275,34 @@ class OpenAIBackendAPI:
                 offset += segment_len
         return 0, 0
 
-    def _upload_image_data(self, value: str, file_name: str = "image.png") -> dict[str, Any]:
-        data = read_oss_reference(value)
+    async def _upload_image_data(self, value: str, file_name: str = "image.png") -> dict[str, Any]:
+        data = await run_blocking(read_oss_reference, value)
         mime = image_media_type(data)
         if mime is None:
             raise RuntimeError("GPT reference download did not return a valid image")
         path = "/backend-api/files"
         width, height = self._image_dimensions(data)
-        response = self.session.post(self.base_url + path, headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
+        response = await self._request("POST", self.base_url + path, headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
                                      json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width, "height": height}, timeout=60)
         ensure_ok(response, path)
         meta = response.json()
-        response = self.session.put(meta["upload_url"], headers={"Content-Type": mime, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08"}, data=data, timeout=120)
+        response = await self._request("PUT", meta["upload_url"], headers={"Content-Type": mime, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08"}, data=data, timeout=120)
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{meta['file_id']}/uploaded"
-        response = self.session.post(self.base_url + path, headers=self._headers(path, {"Content-Type": "application/json"}), data="{}", timeout=60)
+        response = await self._request("POST", self.base_url + path, headers=self._headers(path, {"Content-Type": "application/json"}), data="{}", timeout=60)
         ensure_ok(response, path)
         return {"file_id": meta["file_id"], "file_name": file_name, "mime_type": mime, "file_size": len(data), "width": width, "height": height, "content_hash": hashlib.sha256(data).digest()}
 
-    def _conversation_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _conversation_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         converted = []
         for item in messages:
             role = str(item.get("role") or "user")
             content = item.get("content", "")
+            uploads: list[dict[str, Any]] = []
             if isinstance(content, str):
                 parts: list[Any] = [content]
             else:
                 parts = []
-                uploads: list[dict[str, Any]] = []
                 for part in content if isinstance(content, list) else []:
                     if not isinstance(part, dict):
                         continue
@@ -280,7 +313,7 @@ class OpenAIBackendAPI:
                         value = image_url.get("url") if isinstance(image_url, dict) else part.get("data")
                         if not value:
                             continue
-                        ref = self._upload_image_data(str(value))
+                        ref = await self._upload_image_data(str(value))
                         uploads.append(ref)
                         parts.append({"content_type": "image_asset_pointer", "asset_pointer": f"file-service://{ref['file_id']}",
                                       "width": ref["width"], "height": ref["height"], "size_bytes": ref["file_size"]})
@@ -299,11 +332,11 @@ class OpenAIBackendAPI:
             converted.append(message)
         return converted
 
-    def stream_chat(self, messages: list[dict[str, Any]], model: str = "auto") -> Iterator[str]:
-        self._bootstrap()
-        reqs = self._get_chat_requirements()
+    async def stream_chat(self, messages: list[dict[str, Any]], model: str = "auto") -> AsyncIterator[str]:
+        await self._bootstrap()
+        reqs = await self._get_chat_requirements()
         path = "/backend-api/conversation"
-        payload = {"action": "next", "messages": self._conversation_messages(messages), "model": model, "parent_message_id": str(uuid.uuid4()),
+        payload = {"action": "next", "messages": await self._conversation_messages(messages), "model": model, "parent_message_id": str(uuid.uuid4()),
                    "conversation_mode": {"kind": "primary_assistant"}, "conversation_origin": None,
                    "force_paragen": False, "force_paragen_model_slug": "", "force_rate_limit": False,
                    "force_use_sse": True, "history_and_training_disabled": True, "reset_rate_limits": False,
@@ -312,39 +345,46 @@ class OpenAIBackendAPI:
                    "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 120,
                                                "page_height": 900, "page_width": 1400, "pixel_ratio": 2,
                                                "screen_height": 1440, "screen_width": 2560}}
-        response = self.session.post(self.base_url + path, headers=self._conversation_headers(path, reqs), json=payload, timeout=300, stream=True)
+        response = await self._request("POST", self.base_url + path, headers=self._conversation_headers(path, reqs), json=payload, timeout=300, stream=True)
         ensure_ok(response, path)
         try:
-            yield from iter_sse_payloads(response)
+            async for payload in aiter_sse_payloads(response):
+                yield payload
         finally:
-            response.close()
+            await self._close_stream(response)
 
-    def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:
+    async def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:
         text = ""
         messages = [{"role": "user", "content": ([{"type": "text", "text": prompt}] +
                     [{"type": "image_url", "image_url": {"url": url}} for url in (images or [])])}]
-        for raw in self.stream_chat(messages, model):
-            if raw == "[DONE]":
-                break
-            try:
-                event = json.loads(raw)
-            except Exception:
-                continue
-            for candidate in (event, event.get("v") if isinstance(event, dict) else None):
-                if not isinstance(candidate, dict):
+        completed = False
+        async with aclosing(self.stream_chat(messages, model)) as stream:
+            async for raw in stream:
+                if raw == "[DONE]":
+                    completed = True
+                    break
+                try:
+                    event = json.loads(raw)
+                except Exception:
                     continue
-                message = candidate.get("message") or {}
-                if (message.get("author") or {}).get("role") != "assistant":
-                    continue
-                content = message.get("content") or {}
-                text = content.get("text") or "" if isinstance(content, dict) else ""
-                if not text and isinstance(content, dict):
-                    text = "".join(str(part) for part in content.get("parts") or [] if isinstance(part, str))
+                for candidate in (event, event.get("v") if isinstance(event, dict) else None):
+                    if not isinstance(candidate, dict):
+                        continue
+                    message = candidate.get("message") or {}
+                    if (message.get("author") or {}).get("role") != "assistant":
+                        continue
+                    completed = completed or message.get("status") == "finished_successfully" or message.get("end_turn") is True
+                    content = message.get("content") or {}
+                    text = content.get("text") or "" if isinstance(content, dict) else ""
+                    if not text and isinstance(content, dict):
+                        text = "".join(str(part) for part in content.get("parts") or [] if isinstance(part, str))
+        if not completed:
+            raise RuntimeError("Upstream chat stream ended before completion")
         if not text.strip():
             raise RuntimeError("Upstream chat returned no assistant text")
         return text
 
-    def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "auto") -> str:
+    async def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "auto") -> str:
         """Prepare image conversation and obtain conduit_token."""
         path = "/backend-api/f/conversation/prepare"
         payload = {
@@ -366,7 +406,7 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
-        response = self.session.post(
+        response = await self._request("POST",
             self.base_url + path,
             headers=self._image_headers(path, reqs),
             json=payload,
@@ -375,7 +415,7 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
 
-    def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str, model: str = "auto", references: list[str] | None = None) -> tuple[requests.Response, set[bytes], set[str]]:
+    async def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str, model: str = "auto", references: list[str] | None = None) -> tuple[requests.Response, set[bytes], set[str]]:
         """Initiate image generation SSE long connection."""
         path = "/backend-api/f/conversation"
         parts: list[Any] = []
@@ -385,7 +425,7 @@ class OpenAIBackendAPI:
         if references:
             for value in references:
                 if value:
-                    ref = self._upload_image_data(value)
+                    ref = await self._upload_image_data(value)
                     reference_hashes.add(ref["content_hash"])
                     reference_file_ids.add(ref["file_id"])
                     parts.append({"content_type": "image_asset_pointer", "asset_pointer": f"file-service://{ref['file_id']}",
@@ -393,7 +433,7 @@ class OpenAIBackendAPI:
                     attachments.append({"id": ref["file_id"], "mimeType": ref["mime_type"], "name": ref["file_name"],
                                         "size": ref["file_size"], "width": ref["width"], "height": ref["height"]})
         parts.append(prompt)
-        
+
         message = {
             "id": str(uuid.uuid4()),
             "author": {"role": "user"},
@@ -436,7 +476,7 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
-        response = self.session.post(
+        response = await self._request("POST",
             self.base_url + path,
             headers=self._image_headers(path, reqs, conduit_token, accept="text/event-stream"),
             json=payload,
@@ -627,16 +667,16 @@ class OpenAIBackendAPI:
                     sediment_ids.append(asset_id)
         return file_ids, sediment_ids
 
-    def _conversation_image_asset_ids(
+    async def _conversation_image_asset_ids(
         self, conversation_id: str, excluded_file_ids: set[str] | None = None,
     ) -> tuple[list[str], list[str]]:
         """读取当前会话已落盘的生图结果。"""
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=30)
+        response = await self._request("GET", self.base_url + path, headers=self._headers(path), timeout=30)
         ensure_ok(response, path)
         return self._conversation_generated_image_asset_ids((response.json().get("mapping") or {}), excluded_file_ids)
 
-    def _poll_image_asset_ids(self, conversation_id: str, timeout_secs: float = 120.0, expected_count: int = 1,
+    async def _poll_image_asset_ids(self, conversation_id: str, timeout_secs: float = 120.0, expected_count: int = 1,
                               excluded_file_ids: set[str] | None = None, initial_file_ids: list[str] | None = None,
                               initial_sediment_ids: list[str] | None = None) -> tuple[list[str], list[str]]:
         """轮询会话，直到 GPT 的生图工具输出可下载资产。"""
@@ -648,11 +688,11 @@ class OpenAIBackendAPI:
             return file_ids, sediment_ids
 
         # Initial wait for upstream async task
-        time.sleep(4.0)
+        await asyncio.sleep(4.0)
 
         while (time.time() - start) < timeout_secs:
             try:
-                found_files, found_sediments = self._conversation_image_asset_ids(conversation_id, excluded_file_ids)
+                found_files, found_sediments = await self._conversation_image_asset_ids(conversation_id, excluded_file_ids)
                 for asset_id in found_files:
                     if asset_id not in file_ids:
                         file_ids.append(asset_id)
@@ -664,70 +704,66 @@ class OpenAIBackendAPI:
             if len(file_ids) + len(sediment_ids) >= expected_count:
                 return file_ids, sediment_ids
 
-            time.sleep(3.0)
+            await asyncio.sleep(3.0)
 
         if not file_ids and not sediment_ids:
             raise TimeoutError(f"Image generation timed out after {timeout_secs}s")
         return file_ids, sediment_ids
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    async def _get_file_download_url(self, file_id: str) -> str:
         """Get CDN download URL for a file_id."""
         path = f"/backend-api/files/{file_id}/download"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
+        response = await self._request("GET", self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    async def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """解析 GPT 会话附件类型的生图结果下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
+        response = await self._request("GET", self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}), timeout=60)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def delete_conversation_async(self, conversation_id: str) -> None:
+    async def delete_conversation_async(self, conversation_id: str) -> None:
         """Asynchronously delete temporary conversation to keep account clean."""
         if not conversation_id:
             return
 
-        def _delete():
-            try:
-                path = f"/backend-api/conversation/{conversation_id}"
-                self.session.patch(
-                    self.base_url + path,
-                    headers=self._headers(path, {"Content-Type": "application/json"}),
-                    json={"is_visible": False},
-                    timeout=15,
-                )
-            except Exception:
-                pass
+        try:
+            path = f"/backend-api/conversation/{conversation_id}"
+            await self._request("PATCH",
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json"}),
+                json={"is_visible": False}, timeout=15,
+            )
+        except Exception as exc:
+            logger.warning("GPT conversation cleanup failed reason=%s", type(exc).__name__)
 
-        threading.Thread(target=_delete, daemon=True).start()
-
-    def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None, expected_count: int = 1) -> bytes | list[bytes]:
+    async def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None, expected_count: int = 1) -> bytes | list[bytes]:
         """Main entry: zero-storage in-memory image generation."""
         if not self.access_token:
             raise ValueError("access_token is required for image generation")
 
         # 1. Warm up PoW resources (cached)
-        self._bootstrap()
+        await self._bootstrap()
 
         # 2. Compute Sentinel Token and Proof Token
-        reqs = self._get_chat_requirements()
+        reqs = await self._get_chat_requirements()
 
         # 3. Prepare conversation, get conduit_token
-        conduit_token = self._prepare_image_conversation(prompt, reqs, model)
+        conduit_token = await self._prepare_image_conversation(prompt, reqs, model)
 
         # 4. Start image generation long connection
-        response, reference_hashes, reference_file_ids = self._start_image_generation(prompt, reqs, conduit_token, model, references)
+        response, reference_hashes, reference_file_ids = await self._start_image_generation(prompt, reqs, conduit_token, model, references)
 
         conversation_id = ""
         sse_file_ids: list[str] = []
         sse_sediment_ids: list[str] = []
         try:
             # /f/conversation 的 Patch 事件将生成图片写在 v.message，优先直接取图。
-            for payload in iter_sse_payloads(response):
+            async for payload in aiter_sse_payloads(response):
                 if payload == "[DONE]":
                     break
                 try:
@@ -755,7 +791,7 @@ class OpenAIBackendAPI:
                 except Exception:
                     pass
         finally:
-            response.close()
+            await self._close_stream(response)
 
         if not conversation_id:
             raise RuntimeError("Upstream SSE did not return conversation_id")
@@ -763,7 +799,7 @@ class OpenAIBackendAPI:
         completed = False
         try:
             # 5. Poll for image file IDs
-            file_ids, sediment_ids = self._poll_image_asset_ids(
+            file_ids, sediment_ids = await self._poll_image_asset_ids(
                 conversation_id,
                 expected_count=expected_count,
                 excluded_file_ids=reference_file_ids,
@@ -775,13 +811,13 @@ class OpenAIBackendAPI:
             images: list[bytes] = []
             for source, asset_id in [("file", item) for item in file_ids] + [("attachment", item) for item in sediment_ids]:
                 download_url = (
-                    self._get_file_download_url(asset_id)
+                    await self._get_file_download_url(asset_id)
                     if source == "file"
-                    else self._get_attachment_download_url(conversation_id, asset_id)
+                    else await self._get_attachment_download_url(conversation_id, asset_id)
                 )
                 if not download_url:
                     raise RuntimeError(f"Could not resolve download url for {source} asset {asset_id}")
-                img_resp = self.session.get(download_url, timeout=60)
+                img_resp = await self._request("GET", download_url, timeout=60)
                 ensure_ok(img_resp, "download_image_bytes")
                 if hashlib.sha256(img_resp.content).digest() in reference_hashes:
                     raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
@@ -791,4 +827,4 @@ class OpenAIBackendAPI:
         finally:
             # 仅在图片已完整取回后清理会话，超时时保留网页端结果供后续人工恢复。
             if completed:
-                self.delete_conversation_async(conversation_id)
+                await self.delete_conversation_async(conversation_id)
