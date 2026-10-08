@@ -38,6 +38,9 @@ if sudo -n systemctl restart chatgpt2api; then
   done
 fi
 
+echo '========= REMOTE SERVER LOGS =========' >&2
+sudo -n journalctl -u chatgpt2api -n 100 --no-pager >&2 || true
+echo '======================================' >&2
 echo 'Python 服务检查失败，恢复上一版本' >&2
 if [ -n "$previous" ]; then
   ln -sfn "$previous" "$root/current.rollback"
