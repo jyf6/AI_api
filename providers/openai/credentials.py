@@ -1,4 +1,4 @@
-"""GPT 凭证刷新：同账号合并，先保存，再发布可调度凭证。"""
+"""GPT 凭证刷新：同账号合并，先保存，再发布可调度凭证�?""
 from __future__ import annotations
 
 import asyncio
@@ -13,13 +13,13 @@ from utils.log import logger, stable_log_ref
 
 
 class CredentialUnavailable(RuntimeError):
-    """凭证准备失败；不能作为模型失败重试或容量拒绝。"""
+    """凭证准备失败；不能作为模型失败重试或容量拒绝�?""
 
 
 class GPTCredentials:
     def __init__(self, pool, concurrency: int | None = None):
         self.pool = pool
-        limit = concurrency if concurrency is not None else int(os.getenv("GPT_REFRESH_CONCURRENCY", "5"))
+        limit = concurrency if concurrency is not None else int(os.getenv("GPT_REFRESH_CONCURRENCY") or 5)
         if limit <= 0:
             raise ValueError("GPT_REFRESH_CONCURRENCY must be positive")
         self._slots = asyncio.Semaphore(limit)
@@ -33,7 +33,7 @@ class GPTCredentials:
                 and account.get("access_token_expires_at", 0) - time.time() >= 360)
 
     async def refresh(self, email: str, force: bool = False) -> dict:
-        # 无 await 的查找/创建在单事件循环内合并成同一个任务。
+        # �?await 的查�?创建在单事件循环内合并成同一个任务�?
         task = self._tasks.get(email)
         if task is None or task.done():
             task = asyncio.create_task(self._refresh(email, force))
@@ -45,7 +45,7 @@ class GPTCredentials:
         return await asyncio.shield(task)
 
     async def _refresh(self, email: str, force: bool) -> dict:
-        # 待写库凭证必须优先保存；即使手动 force，也不再发 OAuth。
+        # 待写库凭证必须优先保存；即使手动 force，也不再�?OAuth�?
         if email in self._pending:
             return await self._persist(email)
         failures, retry_at = self._backoff.get(email, (0, 0))
@@ -68,7 +68,7 @@ class GPTCredentials:
                 delay = min(300, 30 * 2 ** min(failures, 4))
                 self._backoff[email] = (failures + 1, time.monotonic() + delay)
                 fatal = self.pool._classify_error(str(exc), getattr(exc, "status_code", None)) == "fatal"
-                # 不记录 OAuth 原始响应或异常正文，后台刷新失败仍留下可追踪事件。
+                # 不记�?OAuth 原始响应或异常正文，后台刷新失败仍留下可追踪事件�?
                 logger.warning("GPT credential refresh failed account_ref=%s version=%s fatal=%s reason=%s",
                                stable_log_ref("gpt-account", email), version, fatal, type(exc).__name__)
                 with self.pool._condition:
@@ -95,7 +95,7 @@ class GPTCredentials:
                 "access_token_expires_at": int(time.time()) + int(data.get("expires_in") or 864000),
                 "plan_type": (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type", account.get("plan_type", "plus")),
             }
-            # 从 OAuth 返回开始保留整套新令牌。网络刷新与写库都不持账号池锁。
+            # �?OAuth 返回开始保留整套新令牌。网络刷新与写库都不持账号池锁�?
             self._pending[email] = (version, patch, account["account_id"])
             with self.pool._condition:
                 current = self.pool._accounts.get(email)
@@ -121,15 +121,14 @@ class GPTCredentials:
         with self.pool._condition:
             current = self.pool._accounts.get(email)
             if current is not None:
-                # 同名删除重建属于新身份，即使版本相同也不能发布旧凭证。
+                # 同名删除重建属于新身份，即使版本相同也不能发布旧凭证�?
                 if replacement is not None and (
                     (current["account_id"] == account_id and current.get("credential_version", 0) == version)
                     or (current["account_id"] == replacement["account_id"] and current.get("credential_version", 0) <= replacement.get("credential_version", 0))
                 ):
                     current.update(replacement)
                     if saved and current.get("error_message") == "credential_auth_invalid":
-                        # 成功保存了新凭证后允许再次验证；仍由健康探测决定恢复派单。
-                        current["error_message"] = ""
+                        # 成功保存了新凭证后允许再次验证；仍由健康探测决定恢复派单�?                        current["error_message"] = ""
                 elif replacement is None and current["account_id"] == account_id:
                     current["status"] = "error"
                 if current["account_id"] == account_id:
@@ -150,7 +149,7 @@ class GPTCredentials:
         if email in self._pending or remaining < 360:
             account = await self.refresh(email)
         elif remaining < 3600:
-            # 旧访问令牌仍安全可用，后台预刷新不拖住本次调用。
+            # 旧访问令牌仍安全可用，后台预刷新不拖住本次调用�?
             task = asyncio.create_task(self.refresh(email))
             task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         if not self.ready(account):
@@ -172,5 +171,5 @@ class GPTCredentials:
             await asyncio.sleep(1)
 
     async def drain(self):
-        # 关闭期间允许已轮换凭证完成保存，不能取消 OAuth 后丢弃返回值。
+        # 关闭期间允许已轮换凭证完成保存，不能取消 OAuth 后丢弃返回值�?
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
