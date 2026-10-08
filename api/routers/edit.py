@@ -1,11 +1,14 @@
 ﻿from __future__ import annotations
 
 import io
+import time
+import uuid
 from threading import Lock
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 from PIL import Image, ImageFilter
 import cv2
 import numpy as np
+from utils.log import logger
 
 router = APIRouter(prefix="/api/edit", tags=["edit"])
 
@@ -16,6 +19,9 @@ u2net_lock = Lock()
 @router.post("/remove-bg")
 def remove_bg(file: UploadFile = File(...)):
     global u2net_session
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    logger.info("event=image_edit_started operation=remove_bg request_id=%s", request_id)
     try:
         content = file.file.read()
         # 首次抠图时再加载模型，避免下载模型阻塞整个代理服务启动。
@@ -26,14 +32,18 @@ def remove_bg(file: UploadFile = File(...)):
                         from rembg import new_session
                         u2net_session = new_session("u2netp")
                     except Exception as rembg_err:
-                        print(f"rembg initialization failed, falling back to GrabCut: {rembg_err}")
+                        logger.warning("event=image_edit_fallback operation=remove_bg request_id=%s from=rembg to=grabcut reason_code=%s",
+                                       request_id, type(rembg_err).__name__)
         if u2net_session is not None:
             try:
                 from rembg import remove
                 output = remove(content, session=u2net_session)
-                return Response(content=output, media_type="image/png")
+                logger.info("event=image_edit_finished operation=remove_bg request_id=%s outcome=success method=rembg duration_ms=%d input_bytes=%d output_bytes=%d",
+                            request_id, int((time.monotonic() - started) * 1000), len(content), len(output))
+                return Response(content=output, media_type="image/png", headers={"X-Request-ID": request_id})
             except Exception as rembg_err:
-                print(f"rembg error, falling back to GrabCut: {rembg_err}")
+                logger.warning("event=image_edit_fallback operation=remove_bg request_id=%s from=rembg to=grabcut reason_code=%s",
+                               request_id, type(rembg_err).__name__)
 
         img_pil = Image.open(io.BytesIO(content)).convert("RGB")
         img_np = np.array(img_pil)
@@ -56,9 +66,15 @@ def remove_bg(file: UploadFile = File(...)):
 
         buf = io.BytesIO()
         result_pil.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
+        output = buf.getvalue()
+        logger.info("event=image_edit_finished operation=remove_bg request_id=%s outcome=success method=grabcut duration_ms=%d input_bytes=%d output_bytes=%d",
+                    request_id, int((time.monotonic() - started) * 1000), len(content), len(output))
+        return Response(content=output, media_type="image/png", headers={"X-Request-ID": request_id})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Remove background failed: {str(e)}")
+        logger.error("event=image_edit_finished operation=remove_bg request_id=%s outcome=failed duration_ms=%d reason_code=%s",
+                     request_id, int((time.monotonic() - started) * 1000), type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"Remove background failed: {str(e)}",
+                            headers={"X-Request-ID": request_id})
 
 
 @router.post("/inpaint")
@@ -67,6 +83,9 @@ def inpaint(
     mask: UploadFile = File(...),
     radius: int = Form(5),
 ):
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    logger.info("event=image_edit_started operation=inpaint request_id=%s", request_id)
     try:
         image_bytes = image.file.read()
         mask_bytes = mask.file.read()
@@ -100,9 +119,15 @@ def inpaint(
 
         buf = io.BytesIO()
         result_pil.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
+        output = buf.getvalue()
+        logger.info("event=image_edit_finished operation=inpaint request_id=%s outcome=success duration_ms=%d input_bytes=%d mask_bytes=%d output_bytes=%d",
+                    request_id, int((time.monotonic() - started) * 1000), len(image_bytes), len(mask_bytes), len(output))
+        return Response(content=output, media_type="image/png", headers={"X-Request-ID": request_id})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Inpainting failed: {str(e)}")
+        logger.error("event=image_edit_finished operation=inpaint request_id=%s outcome=failed duration_ms=%d reason_code=%s",
+                     request_id, int((time.monotonic() - started) * 1000), type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"Inpainting failed: {str(e)}",
+                            headers={"X-Request-ID": request_id})
 
 
 @router.post("/upscale")
@@ -110,6 +135,9 @@ def upscale(
     image: UploadFile = File(...),
     scale: int = Form(2),
 ):
+    request_id = uuid.uuid4().hex
+    started = time.monotonic()
+    logger.info("event=image_edit_started operation=upscale request_id=%s", request_id)
     try:
         content = image.file.read()
         pil_img = Image.open(io.BytesIO(content))
@@ -131,6 +159,12 @@ def upscale(
 
         buf = io.BytesIO()
         upscaled.save(buf, format="PNG")
-        return Response(content=buf.getvalue(), media_type="image/png")
+        output = buf.getvalue()
+        logger.info("event=image_edit_finished operation=upscale request_id=%s outcome=success duration_ms=%d input_bytes=%d output_bytes=%d",
+                    request_id, int((time.monotonic() - started) * 1000), len(content), len(output))
+        return Response(content=output, media_type="image/png", headers={"X-Request-ID": request_id})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upscale failed: {str(e)}")
+        logger.error("event=image_edit_finished operation=upscale request_id=%s outcome=failed duration_ms=%d reason_code=%s",
+                     request_id, int((time.monotonic() - started) * 1000), type(e).__name__)
+        raise HTTPException(status_code=500, detail=f"Upscale failed: {str(e)}",
+                            headers={"X-Request-ID": request_id})

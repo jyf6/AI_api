@@ -12,7 +12,7 @@ from core.database import database
 from core.blocking import run_blocking
 from providers.gemini.webapi import AuthError
 from utils.helper import parse_cookie_string
-from utils.log import logger
+from utils.log import logger, stable_log_ref
 
 
 _AUTH_COOKIE_NAMES = ("__Secure-1PSID", "__Secure-1PSIDTS")
@@ -224,10 +224,13 @@ class GeminiAccountPool(BaseAccountPool):
                 account.get(field) != expected_account.get(field) for field in ("account_id", "credential_version")
             )):
                 return
+            old_status = account.get("status")
             account["status"] = "error"
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500] or "Gemini Cookie 未认证，请更新 Cookie"
             self._save_health(name)
+            logger.warning("event=account_marked_error platform=gemini account_ref=%s old_status=%s new_status=error reason_code=AUTH_FAILED",
+                           stable_log_ref("gemini-account", name), old_status)
             self._condition.notify_all()
 
     def mark_refresh_verification_failed(self, name: str, error: Exception | str, expected_account: dict | None = None) -> None:
@@ -241,11 +244,14 @@ class GeminiAccountPool(BaseAccountPool):
                 account.get(field) != expected_account.get(field) for field in ("account_id", "credential_version")
             )):
                 return
+            old_status = account.get("status")
             account["status"] = "cooldown"
             account["cooldown_until"] = int(time.time() + 300)
             account["failure_count"] = account.get("failure_count", 0) + 1
             account["error_message"] = str(error)[:500]
             self._save_health(name)
+            logger.warning("event=account_cooldown_started platform=gemini account_ref=%s old_status=%s new_status=cooldown reason_code=REFRESH_VERIFICATION_FAILED cooldown_seconds=300",
+                           stable_log_ref("gemini-account", name), old_status)
             self._condition.notify_all()
 
     async def verify_refreshed_client(self, name: str, client: Any) -> None:
@@ -260,7 +266,8 @@ class GeminiAccountPool(BaseAccountPool):
                 raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
         except Exception as exc:
             self.mark_refresh_verification_failed(name, exc, expected_account)
-            logger.warning(f"[Gemini Refresh Verify] 账号 [{name}] 续期后测试失败: {exc}")
+            logger.warning("event=account_refresh_verification_failed platform=gemini account_ref=%s reason_code=%s",
+                           stable_log_ref("gemini-account", name), type(exc).__name__)
             return
 
         with self._condition:
@@ -270,6 +277,7 @@ class GeminiAccountPool(BaseAccountPool):
                            for field in ("account_id", "credential_version"))):
                 return
             account = self._accounts[name]
+            old_status = account.get("status")
             account["status"] = "active"
             account["cooldown_until"] = 0
             account["failure_count"] = 0
@@ -278,11 +286,13 @@ class GeminiAccountPool(BaseAccountPool):
         try:
             await self.merge_cookie(name, dict(client.cookies), client.cookies, generation)
         except Exception as exc:
-            logger.error(f"[Gemini Cookie] 账号 [{name}] 登录态有效但写库失败，将继续重试: {exc}")
+            logger.error("event=account_refresh_persist_failed platform=gemini account_ref=%s reason_code=%s",
+                         stable_log_ref("gemini-account", name), type(exc).__name__)
             return
         with self._condition:
             self._condition.notify_all()
-        logger.info(f"[Gemini Refresh Verify] 账号 [{name}] 续期后真实测试成功，已同步 Cookie")
+        logger.info("event=account_refresh_verified platform=gemini account_ref=%s old_status=%s new_status=active reason_code=refresh_verified",
+                    stable_log_ref("gemini-account", name), old_status)
 
     async def get_client(self, account: dict[str, Any]) -> Any:
         """Return one authenticated refresh client per account."""
@@ -348,7 +358,8 @@ class GeminiAccountPool(BaseAccountPool):
                         raise RuntimeError("Gemini 账号在凭证保存期间已变更")
                     self._clients[name] = client
                     self._condition.notify_all()
-                logger.info(f"[Gemini Client] 账号 [{name}] 已认证，后台续期已启动")
+                logger.info("event=account_client_ready platform=gemini account_ref=%s",
+                            stable_log_ref("gemini-account", name))
                 return client
             except AuthError as exc:
                 await client.close()
@@ -385,7 +396,8 @@ class GeminiAccountPool(BaseAccountPool):
                 except Exception as exc:
                     if self.is_auth_error(exc):
                         self.mark_auth_failed(acc["name"], exc, acc)
-                    logger.warning(f"[Gemini Warmup] 账号 [{acc['name']}] 预热失败: {exc}")
+                    logger.warning("event=account_warmup_failed platform=gemini account_ref=%s reason_code=%s",
+                                   stable_log_ref("gemini-account", acc["name"]), type(exc).__name__)
 
         await asyncio.gather(*(warm_one(acc) for acc in active_accounts))
 
@@ -396,7 +408,7 @@ class GeminiAccountPool(BaseAccountPool):
                 await self._retry_pending_cookie_saves()
                 await self.warmup_clients()
             except Exception as exc:
-                logger.error(f"[Gemini Warmup] 后台维护失败，将在一分钟后重试: {exc}")
+                logger.error("event=account_maintenance_failed platform=gemini reason_code=%s", type(exc).__name__)
             await asyncio.sleep(60)
 
     async def get_request_client(self, account: dict[str, Any]) -> tuple[Any, int]:

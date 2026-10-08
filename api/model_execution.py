@@ -1,11 +1,12 @@
 """模型入口共用准入与断连收尾，容量错误不进入模型重试。"""
 import asyncio
+import time
 
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from core.admission import CapacityUnavailable, current_permit, get_model_admission
-from utils.log import logger
+from utils.log import logger, proxy_log_ref, request_log_context, stable_log_ref
 
 
 async def _wait_disconnect(request: Request):
@@ -15,24 +16,53 @@ async def _wait_disconnect(request: Request):
             return
 
 
-async def execute_model_request(platform: str, request_id: str, call, request: Request | None = None):
+async def acquire_traced_account(service, task_type: str, platform: str, key_field: str, python_attempt: int):
+    """在实际选中账号处记录等待耗时和匿名账号、代理引用。"""
+    started = time.monotonic()
+    try:
+        account = await service.acquire_account(task_type)
+    except Exception as exc:
+        reason = "NO_ACCOUNT" if isinstance(exc, CapacityUnavailable) else type(exc).__name__
+        logger.warning("event=account_acquire_finished outcome=failed platform=%s task_type=%s python_attempt=%d duration_ms=%d reason_code=%s",
+                       platform, task_type, python_attempt, int((time.monotonic() - started) * 1000), reason)
+        raise
+    logger.info("event=account_acquire_finished outcome=success platform=%s task_type=%s python_attempt=%d account_ref=%s proxy_ref=%s duration_ms=%d",
+                platform, task_type, python_attempt, stable_log_ref(f"{platform}-account", account[key_field]),
+                proxy_log_ref(account), int((time.monotonic() - started) * 1000))
+    return account
+
+
+async def execute_model_request(platform: str, request_id: str, call, request: Request | None = None,
+                                java_attempt: int | None = None):
     permit = None
 
     async def work():
         nonlocal permit
+        context_token = request_log_context.set((request_id, java_attempt))
         deadline = asyncio.get_running_loop().time() + 30
-        permit = await get_model_admission().acquire(platform, deadline)
-        token = current_permit.set(permit)
+        waiting_started = time.monotonic()
         try:
-            return await call()
-        except CapacityUnavailable as exc:
-            if permit.upstream_started:
-                raise HTTPException(status_code=502, detail="Upstream attempt started but no account available for retry",
-                                    headers={"X-Request-ID": request_id}) from exc
-            raise
+            try:
+                permit = await get_model_admission().acquire(platform, deadline)
+            except CapacityUnavailable:
+                logger.warning("event=admission_wait_finished outcome=denied platform=%s duration_ms=%d reason_code=CAPACITY_TIMEOUT",
+                               platform, int((time.monotonic() - waiting_started) * 1000))
+                raise
+            logger.info("event=admission_wait_finished outcome=success platform=%s duration_ms=%d",
+                        platform, int((time.monotonic() - waiting_started) * 1000))
+            token = current_permit.set(permit)
+            try:
+                return await call()
+            except CapacityUnavailable as exc:
+                if permit.upstream_started:
+                    raise HTTPException(status_code=502, detail="Upstream attempt started but no account available for retry",
+                                        headers={"X-Request-ID": request_id}) from exc
+                raise
+            finally:
+                current_permit.reset(token)
+                await permit.release()
         finally:
-            current_permit.reset(token)
-            await permit.release()
+            request_log_context.reset(context_token)
 
     worker = asyncio.create_task(work())
 

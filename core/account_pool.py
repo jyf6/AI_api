@@ -261,9 +261,13 @@ class BaseAccountPool:
     def refresh_proxy_status(self, proxy_id: int, status: str) -> None:
         """节点启停变更立即对当前账号调度生效。"""
         with self._condition:
+            previous = {account.get("proxy_status") for account in self._accounts.values() if account.get("proxy_id") == proxy_id}
             for account in self._accounts.values():
                 if account.get("proxy_id") == proxy_id:
                     account["proxy_status"] = status
+            if previous and previous != {status}:
+                logger.info("event=proxy_status_changed platform=%s proxy_ref=%s old_status=%s new_status=%s",
+                            self._platform, stable_log_ref("proxy-node", str(proxy_id)), ",".join(sorted(map(str, previous))), status)
             self._condition.notify_all()
 
     def set_account_health(self, key: str, healthy: bool, error: str = "", *, expected_account: dict | None = None) -> None:
@@ -278,22 +282,23 @@ class BaseAccountPool:
                 for field in ("account_id", "credential_version")
             ):
                 return
+            old_status = account.get("status")
             if healthy:
                 account["status"] = "active"
                 account["cooldown_until"] = 0
                 account["failure_count"] = 0
                 account["error_message"] = ""
                 self._batches.pop(key, None)
-                logger.info("event=account_health_verified platform=%s account_ref=%s status=active",
-                            self._platform, stable_log_ref(f"{self._platform}-account", key))
+                logger.info("event=account_health_verified platform=%s account_ref=%s old_status=%s new_status=active reason_code=verification_passed",
+                            self._platform, stable_log_ref(f"{self._platform}-account", key), old_status)
             else:
                 account["status"] = "error"
                 account["cooldown_until"] = 0
                 account["failure_count"] = account.get("failure_count", 0) + 1
                 account["error_message"] = error[:500]
-                logger.warning("event=account_health_verification_failed platform=%s account_ref=%s reason=%s",
+                logger.warning("event=account_health_verification_failed platform=%s account_ref=%s old_status=%s new_status=error reason_code=%s",
                                self._platform, stable_log_ref(f"{self._platform}-account", key),
-                               "verification_failed")
+                               old_status, "verification_failed")
             self._save_health(key)
             self._condition.notify_all()
 
@@ -327,6 +332,8 @@ class BaseAccountPool:
         if restored_keys:
             for key in restored_keys:
                 self._save_health(key)
+                logger.info("event=account_cooldown_expired platform=%s account_ref=%s old_status=cooldown new_status=active reason_code=cooldown_expired",
+                            self._platform, stable_log_ref(f"{self._platform}-account", key))
             self._condition.notify_all()
 
     # ── Scheduling ──
@@ -499,8 +506,8 @@ class BaseAccountPool:
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
                     self._save_health(key)
-                    logger.error("event=account_marked_error platform=%s account_ref=%s status_code=%s",
-                                 self._platform, stable_log_ref(f"{self._platform}-account", key), status_code)
+                    logger.error("event=account_marked_error platform=%s account_ref=%s old_status=%s new_status=error status_code=%s reason_code=AUTH_OR_ACCOUNT_INVALID",
+                                 self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0], status_code)
                 elif category == "rate_limit":
                     account["status"] = "active"
                     account["cooldown_until"] = int(time.time()) + (retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
@@ -508,20 +515,22 @@ class BaseAccountPool:
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
                     self._save_health(key)
-                    logger.warning("event=account_rate_limited platform=%s account_ref=%s status_code=%s cooldown_seconds=%d",
-                                   self._platform, stable_log_ref(f"{self._platform}-account", key), status_code,
-                                   retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
+                    logger.warning("event=account_rate_limited platform=%s account_ref=%s old_status=%s new_status=active status_code=%s cooldown_seconds=%d cooldown_until=%d reason_code=RATE_LIMIT",
+                                   self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0], status_code,
+                                   retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS,
+                                   account["cooldown_until"])
                 elif failure_scope == "transport":
                     batch["probing"] = True
                     if account.get("proxy_id"):
+                        proxy_ref = proxy_log_ref(account)
                         future = self._health_executor.submit(database.record_proxy_failure, account["proxy_id"])
                         def observe_proxy_failure(done):
                             # 后台记录失败必须可见，日志不包含代理地址或认证信息。
                             try:
                                 done.result()
                             except Exception as exc:
-                                logger.error("Proxy failure persistence failed platform=%s reason=%s",
-                                             self._platform, type(exc).__name__)
+                                logger.error("event=proxy_failure_persist_failed platform=%s proxy_ref=%s reason_code=%s",
+                                             self._platform, proxy_ref, type(exc).__name__)
                         future.add_done_callback(observe_proxy_failure)
                     logger.warning("event=proxy_transport_failure platform=%s account_ref=%s proxy_ref=%s status_code=%s",
                                    self._platform, stable_log_ref(f"{self._platform}-account", key),
@@ -552,8 +561,9 @@ class BaseAccountPool:
                     if current_health != previous_health:
                         self._save_health(key)
                         if account.get("status") == "active" and batch["success"]:
-                            logger.info("event=account_recovered platform=%s account_ref=%s",
-                                        self._platform, stable_log_ref(f"{self._platform}-account", key))
+                            logger.info("event=%s platform=%s account_ref=%s old_status=%s new_status=active reason_code=request_succeeded",
+                                        "account_recovered" if previous_health[0] != "active" else "account_health_cleared",
+                                        self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0])
                 self._batches.pop(key, None)
             self._condition.notify_all()
 

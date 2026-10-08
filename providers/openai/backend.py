@@ -16,7 +16,7 @@ from curl_cffi import requests
 from utils.helper import ImageQuotaExceededError, ensure_ok, aiter_sse_payloads
 from core.blocking import run_blocking
 from core.admission import mark_model_request_started
-from utils.log import logger
+from utils.log import error_http_status, image_stage, logger
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -423,15 +423,16 @@ class OpenAIBackendAPI:
         reference_hashes: set[bytes] = set()
         reference_file_ids: set[str] = set()
         if references:
-            for value in references:
-                if value:
-                    ref = await self._upload_image_data(value)
-                    reference_hashes.add(ref["content_hash"])
-                    reference_file_ids.add(ref["file_id"])
-                    parts.append({"content_type": "image_asset_pointer", "asset_pointer": f"file-service://{ref['file_id']}",
-                                  "width": ref["width"], "height": ref["height"], "size_bytes": ref["file_size"]})
-                    attachments.append({"id": ref["file_id"], "mimeType": ref["mime_type"], "name": ref["file_name"],
-                                        "size": ref["file_size"], "width": ref["width"], "height": ref["height"]})
+            with image_stage("gpt", "reference_upload"):
+                for value in references:
+                    if value:
+                        ref = await self._upload_image_data(value)
+                        reference_hashes.add(ref["content_hash"])
+                        reference_file_ids.add(ref["file_id"])
+                        parts.append({"content_type": "image_asset_pointer", "asset_pointer": f"file-service://{ref['file_id']}",
+                                      "width": ref["width"], "height": ref["height"], "size_bytes": ref["file_size"]})
+                        attachments.append({"id": ref["file_id"], "mimeType": ref["mime_type"], "name": ref["file_name"],
+                                            "size": ref["file_size"], "width": ref["width"], "height": ref["height"]})
         parts.append(prompt)
 
         message = {
@@ -476,14 +477,15 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
-        response = await self._request("POST",
-            self.base_url + path,
-            headers=self._image_headers(path, reqs, conduit_token, accept="text/event-stream"),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
-        ensure_ok(response, path)
+        with image_stage("gpt", "generate_submit"):
+            response = await self._request("POST",
+                self.base_url + path,
+                headers=self._image_headers(path, reqs, conduit_token, accept="text/event-stream"),
+                json=payload,
+                timeout=300,
+                stream=True,
+            )
+            ensure_ok(response, path)
         return response, reference_hashes, reference_file_ids
 
     @staticmethod
@@ -700,7 +702,8 @@ class OpenAIBackendAPI:
                     if asset_id not in sediment_ids:
                         sediment_ids.append(asset_id)
             except Exception as exc:
-                logger.warning(f"Error polling GPT image result for conversation {conversation_id}: {exc}")
+                logger.warning("event=image_result_poll_retry platform=gpt reason_code=%s http_status=%s transport_code=%s",
+                               type(exc).__name__, error_http_status(exc), getattr(exc, "code", None))
             if len(file_ids) + len(sediment_ids) >= expected_count:
                 return file_ids, sediment_ids
 
@@ -747,13 +750,16 @@ class OpenAIBackendAPI:
             raise ValueError("access_token is required for image generation")
 
         # 1. Warm up PoW resources (cached)
-        await self._bootstrap()
+        with image_stage("gpt", "bootstrap"):
+            await self._bootstrap()
 
         # 2. Compute Sentinel Token and Proof Token
-        reqs = await self._get_chat_requirements()
+        with image_stage("gpt", "requirements"):
+            reqs = await self._get_chat_requirements()
 
         # 3. Prepare conversation, get conduit_token
-        conduit_token = await self._prepare_image_conversation(prompt, reqs, model)
+        with image_stage("gpt", "conversation_prepare"):
+            conduit_token = await self._prepare_image_conversation(prompt, reqs, model)
 
         # 4. Start image generation long connection
         response, reference_hashes, reference_file_ids = await self._start_image_generation(prompt, reqs, conduit_token, model, references)
@@ -761,6 +767,9 @@ class OpenAIBackendAPI:
         conversation_id = ""
         sse_file_ids: list[str] = []
         sse_sediment_ids: list[str] = []
+        sse_started = time.monotonic()
+        sse_error: BaseException | None = None
+        logger.info("event=image_stage_started platform=gpt stage=result_stream")
         try:
             # /f/conversation 的 Patch 事件将生成图片写在 v.message，优先直接取图。
             async for payload in aiter_sse_payloads(response):
@@ -790,8 +799,19 @@ class OpenAIBackendAPI:
                     raise
                 except Exception:
                     pass
+        except BaseException as exc:
+            sse_error = exc
+            raise
         finally:
-            await self._close_stream(response)
+            try:
+                await self._close_stream(response)
+            except BaseException as exc:
+                sse_error = exc
+                raise
+            finally:
+                logger.info("event=image_stage_finished platform=gpt stage=result_stream outcome=%s duration_ms=%d asset_count=%d reason_code=%s",
+                            "failed" if sse_error else "success" if conversation_id else "no_result", int((time.monotonic() - sse_started) * 1000),
+                            len(sse_file_ids) + len(sse_sediment_ids), type(sse_error).__name__ if sse_error else "NO_CONVERSATION_ID" if not conversation_id else "none")
 
         if not conversation_id:
             raise RuntimeError("Upstream SSE did not return conversation_id")
@@ -799,29 +819,34 @@ class OpenAIBackendAPI:
         completed = False
         try:
             # 5. Poll for image file IDs
-            file_ids, sediment_ids = await self._poll_image_asset_ids(
-                conversation_id,
-                expected_count=expected_count,
-                excluded_file_ids=reference_file_ids,
-                initial_file_ids=sse_file_ids,
-                initial_sediment_ids=sse_sediment_ids,
-            )
+            with image_stage("gpt", "result_poll"):
+                file_ids, sediment_ids = await self._poll_image_asset_ids(
+                    conversation_id,
+                    expected_count=expected_count,
+                    excluded_file_ids=reference_file_ids,
+                    initial_file_ids=sse_file_ids,
+                    initial_sediment_ids=sse_sediment_ids,
+                )
+            logger.info("event=image_assets_found platform=gpt expected_count=%d count=%d",
+                        expected_count, len(file_ids) + len(sediment_ids))
 
             # 6. Download all results
             images: list[bytes] = []
-            for source, asset_id in [("file", item) for item in file_ids] + [("attachment", item) for item in sediment_ids]:
-                download_url = (
-                    await self._get_file_download_url(asset_id)
-                    if source == "file"
-                    else await self._get_attachment_download_url(conversation_id, asset_id)
-                )
-                if not download_url:
-                    raise RuntimeError(f"Could not resolve download url for {source} asset {asset_id}")
-                img_resp = await self._request("GET", download_url, timeout=60)
-                ensure_ok(img_resp, "download_image_bytes")
-                if hashlib.sha256(img_resp.content).digest() in reference_hashes:
-                    raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
-                images.append(img_resp.content)
+            with image_stage("gpt", "image_download"):
+                for source, asset_id in [("file", item) for item in file_ids] + [("attachment", item) for item in sediment_ids]:
+                    download_url = (
+                        await self._get_file_download_url(asset_id)
+                        if source == "file"
+                        else await self._get_attachment_download_url(conversation_id, asset_id)
+                    )
+                    if not download_url:
+                        raise RuntimeError(f"Could not resolve download url for {source} asset {asset_id}")
+                    img_resp = await self._request("GET", download_url, timeout=60)
+                    ensure_ok(img_resp, "download_image_bytes")
+                    if hashlib.sha256(img_resp.content).digest() in reference_hashes:
+                        raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
+                    images.append(img_resp.content)
+            logger.info("event=image_downloaded platform=gpt count=%d", len(images))
             completed = True
             return images[0] if len(images) == 1 else images
         finally:

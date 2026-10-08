@@ -1,11 +1,48 @@
 import asyncio
+import io
 import json
+import logging
 
 import pytest
 from fastapi import HTTPException
 
 from api.model_execution import execute_model_request
 from core.admission import CapacityUnavailable, ModelAdmission, mark_model_request_started
+from utils.log import RequestLogFilter, logger, python_attempt_log_context
+
+
+def test_request_log_context_isolated_between_concurrent_attempts(monkeypatch):
+    """同一 request_id 的 Java 重试在并发日志中仍可按尝试序号区分。"""
+    async def scenario():
+        owner = ModelAdmission({"gpt": 2, "gemini": 1, "doubao": 1}, 2)
+        monkeypatch.setattr("core.admission.model_admission", owner)
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        handler.addFilter(RequestLogFilter())
+        logger.addHandler(handler)
+        try:
+            async def call(n):
+                token = python_attempt_log_context.set(n)
+                try:
+                    logger.info("event=context_probe")
+                    await asyncio.sleep(0)
+                finally:
+                    python_attempt_log_context.reset(token)
+
+            await asyncio.gather(*(execute_model_request("gpt", "same-request", lambda n=n: call(n), java_attempt=n)
+                                   for n in (1, 2)))
+            logger.info("event=outside_probe")
+        finally:
+            logger.removeHandler(handler)
+        lines = output.getvalue().splitlines()
+        probes = [line for line in lines if "event=context_probe" in line]
+        assert len(probes) == 2
+        assert {line.rsplit("java_attempt=", 1)[-1] for line in probes} == {"1", "2"}
+        assert all("request_id=same-request" in line for line in probes)
+        assert {line.split("python_attempt=", 1)[-1].split()[0] for line in probes} == {"1", "2"}
+        assert "java_attempt=" not in lines[-1]
+
+    asyncio.run(scenario())
 
 
 def test_busy_error_is_safe_only_before_upstream(monkeypatch):

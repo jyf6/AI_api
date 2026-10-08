@@ -10,32 +10,13 @@ from curl_cffi import CurlMime
 from curl_cffi.requests import AsyncSession
 
 from utils.image_binary import image_media_type
+from utils.log import logger
 from utils.oss_reference import read_oss_reference
 
 
 def _prepare_reference_image(image_data: str) -> tuple[bytes, str]:
     """在线程中从 OSS 读取参考图并压缩，避免阻塞代理事件循环。"""
     image_bytes = read_oss_reference(image_data)
-    # 大图压缩同样属于同步工作，必须与下载一起移出事件循环。
-    if len(image_bytes) > 4 * 1024 * 1024:
-        try:
-            import io
-            from PIL import Image
-            img = Image.open(io.BytesIO(image_bytes))
-            max_dim = max(img.width, img.height)
-            if max_dim > 2048:
-                scale = 2048.0 / max_dim
-                new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-                img = img.resize(new_size, Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            img.save(buf, format="JPEG", quality=85, optimize=True)
-            image_bytes = buf.getvalue()
-        except Exception:
-            # 压缩失败沿用原图，保持原有上传行为。
-            pass
-
     content_type = image_media_type(image_bytes)
     if content_type is None:
         raise RuntimeError("Doubao reference download did not return a valid image")
@@ -143,6 +124,7 @@ class DoubaoBackendAPI:
         finally:
             form.close()
         if response.status_code != 200:
+            logger.warning("event=image_upstream_http_failed platform=doubao stage=reference_upload http_status=%d", response.status_code)
             raise RuntimeError(f"Doubao image upload failed ({response.status_code})")
         body = response.json()
         if body.get("code") != 0:
@@ -156,6 +138,7 @@ class DoubaoBackendAPI:
             headers={"Content-Type": "application/json"},
         )
         if response.status_code != 200:
+            logger.warning("event=image_upstream_http_failed platform=doubao stage=reference_url_lookup http_status=%d", response.status_code)
             raise RuntimeError(f"Doubao image URL lookup failed ({response.status_code})")
         body = response.json()
         file_urls = (body.get("data") or {}).get("file_urls") or []
@@ -223,6 +206,7 @@ class DoubaoBackendAPI:
         await mark_model_request_started()
         response = await self.session.post(url, params=self._params(), data=json.dumps(payload, ensure_ascii=False), headers=headers)
         if response.status_code != 200:
+            logger.warning("event=image_upstream_http_failed platform=doubao stage=generate http_status=%d", response.status_code)
             raise RuntimeError(f"Doubao image failed ({response.status_code}): {response.text[:300]}")
         raw = response.content.decode("utf-8", errors="replace")
         urls: list[str] = []
@@ -256,6 +240,7 @@ class DoubaoBackendAPI:
         for url in urls:
             response = await self.session.get(url)
             if response.status_code != 200:
+                logger.warning("event=image_upstream_http_failed platform=doubao stage=image_download http_status=%d", response.status_code)
                 raise RuntimeError(f"Doubao image download failed ({response.status_code})")
             image_bytes = response.content
             if image_media_type(image_bytes) is None:

@@ -14,6 +14,8 @@ class ImageGenerationRequest(BaseModel):
     aspect_ratio: str = Field(..., description="约分后的宽高比，如 3:4")
     images: list[str] = Field(default_factory=list, description="参考图的阿里云 OSS objectKey 列表")
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
+    # Java 对同一 request_id 重发时的序号；其他调用方可以不传。
+    java_attempt: int | None = Field(default=None, ge=1)
     dispatch_id: int | None = None
     task_code: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     operation_id: int | None = None
@@ -39,6 +41,7 @@ class ChatCompletionRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     images: list[str] = Field(default_factory=list, description="参考图的阿里云 OSS objectKey 列表")
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
+    java_attempt: int | None = Field(default=None, ge=1)
     dispatch_id: int | None = None
     task_code: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     operation_id: int | None = None

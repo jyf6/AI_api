@@ -20,13 +20,11 @@ def stitch_images_to_bytes(image_bytes_list: list[bytes], max_width=1024) -> byt
         
     images = []
     for b in image_bytes_list:
-        try:
-            img = Image.open(io.BytesIO(b))
-            img = _ensure_rgb(img)
-            images.append(img)
-        except Exception as e:
-            continue
-            
+        # 任一素材失败都停止，不允许缺图拼接。
+        with Image.open(io.BytesIO(b)) as source:
+            source.load()
+            images.append(_ensure_rgb(source).copy())
+
     if not images:
         raise ValueError("Failed to open any images for stitching")
 
@@ -57,19 +55,23 @@ def stitch_images_to_bytes(image_bytes_list: list[bytes], max_width=1024) -> byt
         grid_image = grid_image.resize((max_width, new_h), Image.Resampling.LANCZOS)
         
     out = io.BytesIO()
-    grid_image.save(out, format="JPEG", quality=85)
-    return out.getvalue()
+    return _encode_bounded_jpeg(grid_image)
 
-def compress_single_image(image_bytes: bytes, max_width=1024) -> bytes:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        img = _ensure_rgb(img)
-        if img.width > max_width:
-            ratio = max_width / img.width
-            new_h = int(img.height * ratio)
-            img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+def _encode_bounded_jpeg(image: Image.Image) -> bytes:
+    """与 Java 同步：先降质量，再缩画布，最终严格小于 3MB。"""
+    quality = 85
+    current = image
+    for _ in range(16):
         out = io.BytesIO()
-        img.save(out, format="JPEG", quality=85)
-        return out.getvalue()
-    except Exception:
-        return image_bytes
+        current.save(out, format="JPEG", quality=quality, optimize=True)
+        data = out.getvalue()
+        if len(data) < 3_000_000:
+            return data
+        if quality > 65:
+            quality = max(65, quality - 10)
+        else:
+            width, height = int(current.width * .8), int(current.height * .8)
+            if min(width, height) < 256:
+                break
+            current = current.resize((width, height), Image.Resampling.LANCZOS)
+    raise ValueError("Contact sheet cannot be reduced below 3 MB")

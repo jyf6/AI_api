@@ -10,7 +10,7 @@ from typing import Any
 
 from curl_cffi.requests import AsyncSession
 
-from utils.log import logger
+from utils.log import error_http_status, image_stage, logger, stable_log_ref
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
 
@@ -93,26 +93,8 @@ def _detect_image_suffix(data: bytes) -> str:
 
 
 def _read_image_source(source: str) -> tuple[bytes, str]:
-    """使用统一的 OSS objectKey 读取私有参考图，并对超过 1MB 的大图转 JPEG 压缩以降低跨境上传耗时。"""
+    """使用统一的 OSS objectKey 读取私有参考图，读取 OSS 已处理且小于 3MB 的图片。"""
     raw = read_oss_reference(source)
-    if len(raw) > 1024 * 1024:
-        try:
-            from PIL import Image
-            img = Image.open(io.BytesIO(raw))
-            max_dim = max(img.width, img.height)
-            if max_dim > 2048:
-                scale = 2048.0 / max_dim
-                img = img.resize(
-                    (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
-                    Image.Resampling.LANCZOS,
-                )
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85, optimize=True)
-            raw = buf.getvalue()
-        except Exception:
-            pass
     if image_media_type(raw) is None:
         raise RuntimeError("Gemini reference download did not return a valid image")
     ext = _detect_image_suffix(raw[:16])
@@ -148,7 +130,8 @@ async def _prepare_reference_images(sources: list[str]):
     files = _create_reference_images(sources)
     preparation = asyncio.create_task(asyncio.to_thread(files.__enter__))
     try:
-        images = await asyncio.shield(preparation)
+        with image_stage("gemini", "reference_prepare"):
+            images = await asyncio.shield(preparation)
     except asyncio.CancelledError:
         # 线程不会随请求取消而停止，完成后关闭它创建的内存对象。
         def cleanup(done: asyncio.Task) -> None:
@@ -191,9 +174,8 @@ class GeminiBackendAPI:
     async def _reconnect(self) -> None:
         """Discard the potentially invalidated client and re-initialize with fresh/cached cookies."""
         from providers.gemini.account import gemini_account_service
-        logger.warning(
-            f"[Gemini Self-Healing] 账号 [{self.account.get('name')}] 遇到疑似认证失效，触发重连自愈..."
-        )
+        logger.warning("event=account_reconnect_started platform=gemini account_ref=%s",
+                       stable_log_ref("gemini-account", self.account.get("name")))
         await gemini_account_service.release_request_client(
             self.account["name"], self.client, self._request_generation, False,
         )
@@ -254,28 +236,33 @@ class GeminiBackendAPI:
         client_model = None if model == "auto" else model
         try:
             async with _prepare_reference_images(references or []) as images:
-                await mark_model_request_started()
-                stream = self.client.generate_content_stream(
-                    prompt, files=images or None, model=client_model
-                )
-                try:
-                    async for output in stream:
-                        images = list(
-                            output.candidates[output.chosen].generated_images
-                            if output.candidates
-                            else []
-                        )
-                        if images:
-                            return [
-                                await _download_generated_image(
-                                    image, self.client, self.account.get("proxy") or None
-                                )
-                                for image in images
-                            ]
-                finally:
-                    # 图片候选已到达即可返回，主动关闭流避免继续等待文本完成标记。
-                    await stream.aclose()
-                raise RuntimeError("Gemini returned no image")
+                generated = []
+                with image_stage("gemini", "generate"):
+                    await mark_model_request_started()
+                    stream = self.client.generate_content_stream(
+                        prompt, files=images or None, model=client_model
+                    )
+                    try:
+                        async for output in stream:
+                            generated = list(
+                                output.candidates[output.chosen].generated_images
+                                if output.candidates else []
+                            )
+                            if generated:
+                                break
+                    finally:
+                        # 图片候选已到达即可返回，主动关闭流避免继续等待文本完成标记。
+                        await stream.aclose()
+                    if not generated:
+                        raise RuntimeError("Gemini returned no image")
+                logger.info("event=image_assets_found platform=gemini count=%d", len(generated))
+                with image_stage("gemini", "image_download"):
+                    downloaded = [
+                        await _download_generated_image(image, self.client, self.account.get("proxy") or None)
+                        for image in generated
+                    ]
+                logger.info("event=image_downloaded platform=gemini count=%d", len(downloaded))
+                return downloaded
         finally:
             # 账号客户端会复用，必须在本次调用结束后清除画幅，防止泄漏到聊天请求。
             _clear_image_aspect_ratio(self.client)
@@ -314,7 +301,8 @@ async def _download_generated_image(image: Any, client: Any, proxy: str | None) 
             if full_size_url:
                 rpc_url = full_size_url + "=d-I?alr=yes"
         except Exception as exc:
-            logger.debug(f"Failed to get full size URL via RPC: {exc}")
+            logger.info("event=image_download_fallback platform=gemini from=rpc_url to=cdn reason_code=%s",
+                        type(exc).__name__)
 
     # 2. 准备官方 CDN 降级兜底直链（替换/增加 =s2048-rj 获得高清画质，永不 403）
     cdn_url = getattr(image, "url", "")
@@ -341,9 +329,11 @@ async def _download_generated_image(image: Any, client: Any, proxy: str | None) 
                         break
 
                     if image_media_type(response.content) is not None:
+                        logger.info("event=image_download_source platform=gemini source=rpc bytes=%d", len(response.content))
                         return response.content
             except Exception as exc:
-                logger.warning(f"RPC full size image download failed ({exc}), falling back to Google CDN URL.")
+                logger.warning("event=image_download_fallback platform=gemini from=rpc to=cdn reason_code=%s http_status=%s",
+                               type(exc).__name__, error_http_status(exc))
 
         # 4. 降级方案：走 Google CDN URL 下载
         if cdn_url:
@@ -351,8 +341,10 @@ async def _download_generated_image(image: Any, client: Any, proxy: str | None) 
                 response = await session.get(cdn_url, headers=headers)
                 response.raise_for_status()
                 if image_media_type(response.content) is not None:
+                    logger.info("event=image_download_source platform=gemini source=cdn bytes=%d", len(response.content))
                     return response.content
             except Exception as exc:
-                logger.warning(f"Google CDN image download failed: {exc}")
+                logger.warning("event=image_download_failed platform=gemini source=cdn reason_code=%s http_status=%s",
+                               type(exc).__name__, error_http_status(exc))
 
     raise RuntimeError("Gemini image download did not return a valid image")
