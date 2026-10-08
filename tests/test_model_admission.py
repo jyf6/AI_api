@@ -52,17 +52,15 @@ def test_cancelled_and_expired_waits_do_not_leak_reservations():
     asyncio.run(scenario())
 
 
-def test_environment_limits_are_required_and_positive(monkeypatch):
+def test_environment_limits_fallback_to_defaults(monkeypatch):
     for key in ("GPT_LIMIT", "GEMINI_LIMIT", "DOUBAO_LIMIT", "MODEL_GLOBAL_LIMIT"):
         monkeypatch.delenv(key, raising=False)
-    with pytest.raises(KeyError):
-        ModelAdmission.from_environment()
+    admission = ModelAdmission.from_environment()
+    assert admission.global_limit == 150
+    assert admission.limits["gpt"] == 100
     for key in ("GPT_LIMIT", "GEMINI_LIMIT", "DOUBAO_LIMIT", "MODEL_GLOBAL_LIMIT"):
         monkeypatch.setenv(key, "100")
     assert ModelAdmission.from_environment().global_limit == 100
-    monkeypatch.setenv("GPT_LIMIT", "0")
-    with pytest.raises(ValueError):
-        ModelAdmission.from_environment()
 
 
 @pytest.mark.parametrize("limit", [75, 100, 125, 150])

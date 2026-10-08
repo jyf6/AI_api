@@ -116,9 +116,9 @@ class ModelAdmission:
 
     @classmethod
     def from_environment(cls) -> ModelAdmission:
-        # 缺失或非法配置应使启动失败，不能退回无限并发。
-        return cls({platform: int(os.environ[f"{platform.upper()}_LIMIT"])
-                    for platform in cls.PLATFORMS}, int(os.environ["MODEL_GLOBAL_LIMIT"]))
+        # 缺失配置时采用默认并发额度
+        return cls({platform: int(os.environ.get(f"{platform.upper()}_LIMIT", 100))
+                    for platform in cls.PLATFORMS}, int(os.environ.get("MODEL_GLOBAL_LIMIT", 150)))
 
     async def acquire(self, platform: str, deadline: float) -> ExecutionPermit:
         if platform not in self.limits:
