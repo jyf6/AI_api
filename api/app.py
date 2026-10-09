@@ -48,6 +48,8 @@ def create_app() -> FastAPI:
         capacity_task = asyncio.create_task(publish_capacity_snapshots(redis_client))
         # 后台限并发预热，并持续恢复中断的续期客户端。
         warmup_task = asyncio.create_task(gemini_account_service.maintain_clients())
+        # 后台异步预热图像算法模型（如 rembg），消除用户首次去背的冷启动延迟
+        edit_warmup_task = asyncio.create_task(asyncio.to_thread(edit.warmup_edit_models))
         yield
         credential_task.cancel()
         try:
@@ -58,6 +60,11 @@ def create_app() -> FastAPI:
         warmup_task.cancel()
         try:
             await warmup_task
+        except asyncio.CancelledError:
+            pass
+        edit_warmup_task.cancel()
+        try:
+            await edit_warmup_task
         except asyncio.CancelledError:
             pass
         await gemini_account_service.close_clients()
