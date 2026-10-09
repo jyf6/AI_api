@@ -189,30 +189,34 @@ class GeminiBackendAPI:
             await mark_model_request_started()
             stream = self.client.generate_content_stream(prompt, files=images or None, model=client_model)
             text = ""
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 120
             try:
                 while True:
-                    # 首段文本包含多图上传与模型预填充，最多等待 120 秒；已有文本后，空闲 6 秒即使用现有结果返回。
+                    # 首段最多等 120 秒；有文本后，仅新文本重置 10 秒兜底期限。
                     try:
-                        output = await asyncio.wait_for(anext(stream), timeout=6 if text else 120)
+                        output = await asyncio.wait_for(anext(stream), timeout=max(0, deadline - loop.time()))
                     except TimeoutError:
-                        if text:
+                        if text.strip():
+                            logger.warning("event=analysis_stream_finished platform=gemini reason=idle_fallback idle_seconds=10")
                             return text.strip()
                         raise RuntimeError("Gemini did not return text within 120 seconds") from None
 
                     current_text = output.candidates[output.chosen].text if output.candidates else ""
-                    text = current_text or getattr(output, "text", "") or text
+                    if current_text and current_text != text:
+                        text = current_text
+                        deadline = loop.time() + 10
+                    # 明确完成优先于时间兜底；完成帧可以不带新增文本。
+                    if output.is_completed:
+                        if text.strip():
+                            return text.strip()
+                        raise RuntimeError("Gemini returned no assistant text")
             except StopAsyncIteration:
                 if text.strip():
                     return text.strip()
                 raise RuntimeError("Gemini returned no assistant text")
-            except Exception as exc:
-                # 已获得有效分析文本后，流连接的收尾异常不应覆盖已有结果并触发上游重放。
-                if text.strip():
-                    logger.warning(f"Gemini analysis stream ended after text was received: {exc}")
-                    return text.strip()
-                raise
             finally:
-                # 文本结果可用后不再等待网页端的最终完成标记，主动结束本次流。
+                # 完成、超时或失败都释放本次流；异常不再伪装成完整分析结果。
                 await stream.aclose()
 
     async def chat(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:

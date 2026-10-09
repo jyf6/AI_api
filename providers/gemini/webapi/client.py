@@ -1791,6 +1791,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                             yield ModelOutput(
                                                 metadata=[cid, rid],
                                                 candidates=output_candidates,
+                                                is_completed=is_completed,
                                             )
                                 except json.JSONDecodeError:
                                     continue

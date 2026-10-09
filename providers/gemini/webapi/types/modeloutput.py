@@ -26,6 +26,8 @@ class ModelOutput(BaseModel):
     metadata: list[str]
     candidates: list[Candidate]
     chosen: int = 0
+    # 网页流明确给出的完成状态，供调用层优先结束分析。
+    is_completed: bool = False
 
     def __str__(self) -> str:
         return shorten(self.text, width=100)
