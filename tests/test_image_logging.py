@@ -2,14 +2,17 @@ import asyncio
 import io
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from PIL import Image
 from starlette.datastructures import UploadFile
 
-from api.routers import edit, images
-from providers.gemini import backend as gemini_backend
+# 路由导入会初始化各平台账号池；日志单测使用空账号池，不连接真实 MySQL。
+# 替身仅覆盖导入阶段，后续测试继续使用各自的 monkeypatch。
+with patch("core.database.database.list_accounts", return_value=[]):
+    from api.routers import edit, images
+    from providers.gemini import backend as gemini_backend
 from utils.log import error_http_status
 
 
@@ -60,8 +63,12 @@ def test_invalid_image_does_not_mark_account_success(monkeypatch, platform, resu
     assert released.call_args.args[2] == ""
 
 
-@pytest.mark.parametrize("operation", ["remove_bg", "inpaint", "upscale"])
-def test_edits_log_completion(monkeypatch, operation):
+@pytest.mark.parametrize("operation,media_type,image_format", [
+    ("remove_bg", "image/png", "PNG"),
+    ("inpaint", "image/png", "PNG"),
+    ("upscale", "image/jpeg", "JPEG"),
+])
+def test_edits_log_completion(monkeypatch, operation, media_type, image_format):
     source = io.BytesIO()
     Image.new("RGB", (2, 2), "red").save(source, format="PNG")
     log_info = Mock()
@@ -78,7 +85,10 @@ def test_edits_log_completion(monkeypatch, operation):
     else:
         response = edit.upscale(upload(), scale=2)
 
-    assert response.media_type == "image/png"
+    # 不透明图片放大按接口契约返回 JPEG；响应头须与实际图片编码一致。
+    assert response.media_type == media_type
+    with Image.open(io.BytesIO(response.body)) as result:
+        assert result.format == image_format
     assert response.headers["X-Request-ID"]
     assert any(f"event=image_edit_finished operation={operation}" in call.args[0]
                for call in log_info.call_args_list)
