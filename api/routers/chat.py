@@ -187,6 +187,48 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
 
 async def _chat_completions(body: ChatCompletionRequest):
+    """拼图只准备一次，模型重试复用；请求结束释放所有临时图片。"""
+    from utils.oss_reference import release_memory_references
+    memory_keys = []
+    try:
+        if body.reference_image_count and body.reference_image_count >= 2:
+            preparation = asyncio.create_task(asyncio.to_thread(_prepare_analysis_images, body, memory_keys))
+            try:
+                images = await asyncio.shield(preparation)
+            except asyncio.CancelledError:
+                # 等不可取消的下载线程结束，避免 finally 之后才写入内存导致泄漏。
+                await asyncio.gather(preparation, return_exceptions=True)
+                raise
+            except Exception as exc:
+                logger.warning("event=analysis_reference_prepare_failed request_id=%s reason_code=%s",
+                               body.request_id, type(exc).__name__)
+                raise HTTPException(status_code=502, detail="Reference image preparation failed",
+                                    headers={"X-Request-ID": body.request_id}) from exc
+            body = body.model_copy(update={"images": images})
+        return await _chat_completions_prepared(body)
+    finally:
+        release_memory_references(memory_keys)
+
+
+def _prepare_analysis_images(body: ChatCompletionRequest, memory_keys: list[str]) -> list[str]:
+    """仅处理调用方明确标记的参考图，不混入产品九宫格。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from utils.oss_reference import read_oss_reference, put_memory_reference
+    from utils.image_stitch import stitch_reference_sheets
+    count = body.reference_image_count
+    with ThreadPoolExecutor(max_workers=min(10, count)) as executor:
+        data = list(executor.map(lambda source: read_oss_reference(source, 768), body.images[:count]))
+    result = []
+    for sheet in stitch_reference_sheets(data):
+        key = put_memory_reference(sheet)
+        memory_keys.append(key)
+        result.append(key)
+    logger.info("event=analysis_references_prepared request_id=%s reference_count=%d sheet_count=%d",
+                body.request_id, count, len(result))
+    return result + body.images[count:]
+
+
+async def _chat_completions_prepared(body: ChatCompletionRequest):
     """
     多模态对话与分析接口：
     具备代理侧智能文本校验与就地自动重试机制。

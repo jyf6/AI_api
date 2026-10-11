@@ -1,0 +1,400 @@
+
+=================================== ERRORS ====================================
+________________ ERROR collecting test/test_account_export.py _________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_account_export.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_account_export.py:6: in <module>
+    from services.account_service import AccountService
+E   ModuleNotFoundError: No module named 'services'
+__________ ERROR collecting test/test_account_image_capabilities.py ___________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_account_image_capabilities.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_account_image_capabilities.py:11: in <module>
+    from services.account_service import AccountService
+E   ModuleNotFoundError: No module named 'services'
+_____________ ERROR collecting test/test_chat_completion_cache.py _____________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_chat_completion_cache.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_chat_completion_cache.py:8: in <module>
+    from services.config import config
+E   ModuleNotFoundError: No module named 'services'
+_______________ ERROR collecting test/test_database_storage.py ________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_database_storage.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_database_storage.py:5: in <module>
+    from services.storage.database_storage import (
+E   ModuleNotFoundError: No module named 'services'
+____________ ERROR collecting test/test_gemini_account_service.py _____________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_gemini_account_service.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_gemini_account_service.py:1: in <module>
+    from services.gemini_account_service import GeminiAccountService
+E   ModuleNotFoundError: No module named 'services'
+____________ ERROR collecting test/test_gemini_client_lifecycle.py ____________
+.venv\Lib\site-packages\pymysql\connections.py:682: in connect
+    sock = socket.create_connection(
+D:\Python\Lib\socket.py:864: in create_connection
+    raise exceptions[0]
+D:\Python\Lib\socket.py:849: in create_connection
+    sock.connect(sa)
+E   ConnectionRefusedError: [WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�
+
+During handling of the above exception, another exception occurred:
+test\test_gemini_client_lifecycle.py:10: in <module>
+    from providers.gemini.account import GeminiAccountPool, _restore_cookies
+providers\gemini\account.py:564: in <module>
+    gemini_account_service = GeminiAccountPool()
+                             ^^^^^^^^^^^^^^^^^^^
+providers\gemini\account.py:95: in __init__
+    super().__init__(platform="gemini")
+core\account_pool.py:68: in __init__
+    self._accounts: dict[str, dict[str, Any]] = self._load()
+                                                ^^^^^^^^^^^^
+core\account_pool.py:145: in _load
+    rows = database.list_accounts(self._platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+core\database.py:212: in list_accounts
+    with self._connect() as conn:
+         ^^^^^^^^^^^^^^^
+core\database.py:22: in _connect
+    return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+.venv\Lib\site-packages\pymysql\connections.py:372: in __init__
+    self.connect()
+.venv\Lib\site-packages\pymysql\connections.py:744: in connect
+    raise exc
+E   pymysql.err.OperationalError: (2003, "Can't connect to MySQL server on '127.0.0.1' ([WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�)")
+___________ ERROR collecting test/test_gpt_doubao_account_health.py ___________
+.venv\Lib\site-packages\pymysql\connections.py:682: in connect
+    sock = socket.create_connection(
+D:\Python\Lib\socket.py:864: in create_connection
+    raise exceptions[0]
+D:\Python\Lib\socket.py:849: in create_connection
+    sock.connect(sa)
+E   ConnectionRefusedError: [WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�
+
+During handling of the above exception, another exception occurred:
+test\test_gpt_doubao_account_health.py:5: in <module>
+    from api.routers import accounts as account_routes
+api\routers\accounts.py:6: in <module>
+    from providers.openai.account import account_service
+providers\openai\account.py:267: in <module>
+    account_service = OpenAIAccountPool()
+                      ^^^^^^^^^^^^^^^^^^^
+providers\openai\account.py:24: in __init__
+    super().__init__(platform="gpt")
+core\account_pool.py:68: in __init__
+    self._accounts: dict[str, dict[str, Any]] = self._load()
+                                                ^^^^^^^^^^^^
+core\account_pool.py:145: in _load
+    rows = database.list_accounts(self._platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+core\database.py:212: in list_accounts
+    with self._connect() as conn:
+         ^^^^^^^^^^^^^^^
+core\database.py:22: in _connect
+    return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+.venv\Lib\site-packages\pymysql\connections.py:372: in __init__
+    self.connect()
+.venv\Lib\site-packages\pymysql\connections.py:744: in connect
+    raise exc
+E   pymysql.err.OperationalError: (2003, "Can't connect to MySQL server on '127.0.0.1' ([WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�)")
+__________________ ERROR collecting test/test_gpt_search.py ___________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_gpt_search.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_gpt_search.py:9: in <module>
+    from services.openai_backend_api import OpenAIBackendAPI
+E   ModuleNotFoundError: No module named 'services'
+_____________________ ERROR collecting test/test_image.py _____________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image.py:3: in <module>
+    from services.protocol import openai_v1_image_generations
+E   ModuleNotFoundError: No module named 'services'
+______________ ERROR collecting test/test_image_base_url_api.py _______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_base_url_api.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_base_url_api.py:5: in <module>
+    import api.support as api_support
+E   ModuleNotFoundError: No module named 'api.support'
+____________ ERROR collecting test/test_image_binary_validation.py ____________
+.venv\Lib\site-packages\pymysql\connections.py:682: in connect
+    sock = socket.create_connection(
+D:\Python\Lib\socket.py:864: in create_connection
+    raise exceptions[0]
+D:\Python\Lib\socket.py:849: in create_connection
+    sock.connect(sa)
+E   ConnectionRefusedError: [WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�
+
+During handling of the above exception, another exception occurred:
+test\test_image_binary_validation.py:7: in <module>
+    from api.routers import images
+api\routers\images.py:13: in <module>
+    from providers.doubao.account import doubao_account_service
+providers\doubao\account.py:96: in <module>
+    doubao_account_service = DoubaoAccountPool()
+                             ^^^^^^^^^^^^^^^^^^^
+providers\doubao\account.py:20: in __init__
+    super().__init__(platform="doubao")
+core\account_pool.py:68: in __init__
+    self._accounts: dict[str, dict[str, Any]] = self._load()
+                                                ^^^^^^^^^^^^
+core\account_pool.py:145: in _load
+    rows = database.list_accounts(self._platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+core\database.py:212: in list_accounts
+    with self._connect() as conn:
+         ^^^^^^^^^^^^^^^
+core\database.py:22: in _connect
+    return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+.venv\Lib\site-packages\pymysql\connections.py:372: in __init__
+    self.connect()
+.venv\Lib\site-packages\pymysql\connections.py:744: in connect
+    raise exc
+E   pymysql.err.OperationalError: (2003, "Can't connect to MySQL server on '127.0.0.1' ([WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�)")
+___________ ERROR collecting test/test_image_remove_conversation.py ___________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_remove_conversation.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_remove_conversation.py:4: in <module>
+    from services.config import config
+E   ModuleNotFoundError: No module named 'services'
+_____________ ERROR collecting test/test_image_storage_service.py _____________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_storage_service.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_storage_service.py:10: in <module>
+    from services.image_storage_service import ImageStorageService
+E   ModuleNotFoundError: No module named 'services'
+______________ ERROR collecting test/test_image_task_service.py _______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_task_service.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_task_service.py:9: in <module>
+    from services.image_task_service import ImageTaskService
+E   ModuleNotFoundError: No module named 'services'
+________________ ERROR collecting test/test_image_tasks_api.py ________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_tasks_api.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_tasks_api.py:10: in <module>
+    import api.image_tasks as image_tasks_module
+E   ModuleNotFoundError: No module named 'api.image_tasks'
+_________________ ERROR collecting test/test_image_tokens.py __________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_image_tokens.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_image_tokens.py:5: in <module>
+    from utils.image_tokens import (
+E   ModuleNotFoundError: No module named 'utils.image_tokens'
+______________ ERROR collecting test/test_model_capabilities.py _______________
+.venv\Lib\site-packages\pymysql\connections.py:682: in connect
+    sock = socket.create_connection(
+D:\Python\Lib\socket.py:864: in create_connection
+    raise exceptions[0]
+D:\Python\Lib\socket.py:849: in create_connection
+    sock.connect(sa)
+E   ConnectionRefusedError: [WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�
+
+During handling of the above exception, another exception occurred:
+test\test_model_capabilities.py:4: in <module>
+    from api.routers import accounts
+api\routers\accounts.py:6: in <module>
+    from providers.openai.account import account_service
+providers\openai\account.py:267: in <module>
+    account_service = OpenAIAccountPool()
+                      ^^^^^^^^^^^^^^^^^^^
+providers\openai\account.py:24: in __init__
+    super().__init__(platform="gpt")
+core\account_pool.py:68: in __init__
+    self._accounts: dict[str, dict[str, Any]] = self._load()
+                                                ^^^^^^^^^^^^
+core\account_pool.py:145: in _load
+    rows = database.list_accounts(self._platform)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+core\database.py:212: in list_accounts
+    with self._connect() as conn:
+         ^^^^^^^^^^^^^^^
+core\database.py:22: in _connect
+    return pymysql.connect(host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+.venv\Lib\site-packages\pymysql\connections.py:372: in __init__
+    self.connect()
+.venv\Lib\site-packages\pymysql\connections.py:744: in connect
+    raise exc
+E   pymysql.err.OperationalError: (2003, "Can't connect to MySQL server on '127.0.0.1' ([WinError 10061] ����Ŀ�����������ܾ����޷����ӡ�)")
+_____________ ERROR collecting test/test_model_catalog_service.py _____________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_model_catalog_service.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_model_catalog_service.py:8: in <module>
+    from services.account_service import AccountService
+E   ModuleNotFoundError: No module named 'services'
+______________ ERROR collecting test/test_multi_image_results.py ______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_multi_image_results.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_multi_image_results.py:7: in <module>
+    from services.config import config
+E   ModuleNotFoundError: No module named 'services'
+_______________ ERROR collecting test/test_proxy_runtime_api.py _______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_proxy_runtime_api.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_proxy_runtime_api.py:10: in <module>
+    import api.system as system_module
+E   ModuleNotFoundError: No module named 'api.system'
+_____________ ERROR collecting test/test_proxy_runtime_config.py ______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_proxy_runtime_config.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_proxy_runtime_config.py:8: in <module>
+    from services.config import (
+E   ModuleNotFoundError: No module named 'services'
+_________________ ERROR collecting test/test_proxy_service.py _________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_proxy_service.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_proxy_service.py:10: in <module>
+    from services.config import DEFAULT_PROXY_RUNTIME
+E   ModuleNotFoundError: No module named 'services'
+______________ ERROR collecting test/test_text_model_routing.py _______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_text_model_routing.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_text_model_routing.py:9: in <module>
+    from services.account_service import AccountService
+E   ModuleNotFoundError: No module named 'services'
+______________ ERROR collecting test/test_v1_chat_completions.py ______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_v1_chat_completions.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_v1_chat_completions.py:9: in <module>
+    from utils.helper import save_images_from_text
+E   ImportError: cannot import name 'save_images_from_text' from 'utils.helper' (D:\imageProject\chatgpt2api\utils\helper.py)
+______________ ERROR collecting test/test_v1_images_edits_api.py ______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_v1_images_edits_api.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_v1_images_edits_api.py:10: in <module>
+    import api.ai as ai_module
+E   ModuleNotFoundError: No module named 'api.ai'
+_____________ ERROR collecting test/test_v1_images_edits_json.py ______________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_v1_images_edits_json.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_v1_images_edits_json.py:13: in <module>
+    import api.ai as ai_module
+E   ModuleNotFoundError: No module named 'api.ai'
+___________________ ERROR collecting test/test_v1_models.py ___________________
+ImportError while importing test module 'D:\imageProject\chatgpt2api\test\test_v1_models.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+D:\Python\Lib\importlib\__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test\test_v1_models.py:9: in <module>
+    from services.protocol import openai_v1_models
+E   ModuleNotFoundError: No module named 'services'
+=========================== short test summary info ===========================
+ERROR test/test_account_export.py
+ERROR test/test_account_image_capabilities.py
+ERROR test/test_chat_completion_cache.py
+ERROR test/test_database_storage.py
+ERROR test/test_gemini_account_service.py
+ERROR test/test_gemini_client_lifecycle.py - pymysql.err.OperationalError: (2...
+ERROR test/test_gpt_doubao_account_health.py - pymysql.err.OperationalError: ...
+ERROR test/test_gpt_search.py
+ERROR test/test_image.py
+ERROR test/test_image_base_url_api.py
+ERROR test/test_image_binary_validation.py - pymysql.err.OperationalError: (2...
+ERROR test/test_image_remove_conversation.py
+ERROR test/test_image_storage_service.py
+ERROR test/test_image_task_service.py
+ERROR test/test_image_tasks_api.py
+ERROR test/test_image_tokens.py
+ERROR test/test_model_capabilities.py - pymysql.err.OperationalError: (2003, ...
+ERROR test/test_model_catalog_service.py
+ERROR test/test_multi_image_results.py
+ERROR test/test_proxy_runtime_api.py
+ERROR test/test_proxy_runtime_config.py
+ERROR test/test_proxy_service.py
+ERROR test/test_text_model_routing.py
+ERROR test/test_v1_chat_completions.py
+ERROR test/test_v1_images_edits_api.py
+ERROR test/test_v1_images_edits_json.py
+ERROR test/test_v1_models.py
+!!!!!!!!!!!!!!!!!! Interrupted: 27 errors during collection !!!!!!!!!!!!!!!!!!!
+27 errors in 11.50s

@@ -1,6 +1,6 @@
 import math
 import io
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 def _ensure_rgb(img):
     if img.mode in ("RGBA", "P", "LA"):
@@ -75,3 +75,28 @@ def _encode_bounded_jpeg(image: Image.Image) -> bytes:
                 break
             current = current.resize((width, height), Image.Resampling.LANCZOS)
     raise ValueError("Contact sheet cannot be reduced below 3 MB")
+
+
+def stitch_reference_sheets(image_bytes_list: list[bytes]) -> list[bytes]:
+    """参考图每四张一页，连续 R 编号与图片内容分区，保持原始顺序。"""
+    sheets = []
+    font = ImageFont.load_default(size=28)
+    for start in range(0, len(image_bytes_list), 4):
+        group = image_bytes_list[start:start + 4]
+        cols = min(2, len(group))
+        rows = math.ceil(len(group) / cols)
+        # 768 像素单元含 40 像素编号区，整页最长边不超过 1536。
+        with Image.new("RGB", (cols * 768, rows * 768), "white") as canvas:
+            draw = ImageDraw.Draw(canvas)
+            for offset, data in enumerate(group):
+                x, y = (offset % cols) * 768, (offset // cols) * 768
+                draw.text((x + 12, y + 4), f"R{start + offset + 1}", fill="black", font=font)
+                with Image.open(io.BytesIO(data)) as source:
+                    rgb = _ensure_rgb(source).convert("RGB")
+                    try:
+                        rgb.thumbnail((768, 728), Image.Resampling.LANCZOS)
+                        canvas.paste(rgb, (x + (768 - rgb.width) // 2, y + 40 + (728 - rgb.height) // 2))
+                    finally:
+                        rgb.close()
+            sheets.append(_encode_bounded_jpeg(canvas))
+    return sheets

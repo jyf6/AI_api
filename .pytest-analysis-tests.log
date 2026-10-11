@@ -1,0 +1,23 @@
+.......................................sss.............................. [ 66%]
+.....................................                                    [100%]
+============================== warnings summary ===============================
+tests/test_model_request_lifecycle.py::test_real_uvicorn_tcp_disconnect_obeys_model_start_boundary[False]
+  D:\imageProject\chatgpt2api\.venv\Lib\site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/test_model_request_lifecycle.py::test_real_uvicorn_tcp_disconnect_obeys_model_start_boundary[False]
+  D:\imageProject\chatgpt2api\.venv\Lib\site-packages\uvicorn\protocols\websockets\websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+    from websockets.server import WebSocketServerProtocol
+
+tests/test_openai_async_backend.py::test_credential_refresh_sends_one_authorization_header
+tests/test_openai_async_backend.py::test_real_async_session_can_close_sse_before_upstream_finishes
+  D:\imageProject\chatgpt2api\.venv\Lib\site-packages\curl_cffi\aio.py:186: CurlCffiWarning: 
+      Proactor event loop does not implement add_reader family of methods required.
+      Registering an additional selector thread for add_reader support.
+      To avoid this warning use:
+          asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+      
+    self.loop = get_selector(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+106 passed, 3 skipped, 4 warnings in 4.13s
