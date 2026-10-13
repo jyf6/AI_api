@@ -5,7 +5,7 @@ import math
 
 def parse_and_normalize_ratio(aspect_ratio: str) -> tuple[int, int, str]:
     """校验并约分宽高比。
-    格式必须为 W:H，宽高均为 1~100 的整数，整体介于 1:4 至 4:1 之间。
+    格式必须为 W:H，宽高均为正整数；不限制比例范围。
     非约分值自动规范化（如 1200:1600 规范化为 3:4）。
     """
     if not aspect_ratio or not isinstance(aspect_ratio, str):
@@ -20,17 +20,13 @@ def parse_and_normalize_ratio(aspect_ratio: str) -> tuple[int, int, str]:
     except ValueError as exc:
         raise ValueError(f"aspect_ratio 必须为整数比例，收到: {aspect_ratio}") from exc
 
-    if w < 1 or w > 100 or h < 1 or h > 100:
-        raise ValueError(f"aspect_ratio 宽高值必须在 1 至 100 之间，收到: {w}:{h}")
+    if w < 1 or h < 1:
+        raise ValueError(f"aspect_ratio 宽高值必须为正整数，收到: {w}:{h}")
 
     # 最大公约数约分
     g = math.gcd(w, h)
     w //= g
     h //= g
-
-    ratio_val = w / h
-    if ratio_val < 0.25 or ratio_val > 4.0:
-        raise ValueError(f"aspect_ratio 超出 1:4 至 4:1 范围，约分后为: {w}:{h}")
 
     return w, h, f"{w}:{h}"
 
