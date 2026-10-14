@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import io
+import os
 import time
 import uuid
 from threading import Lock
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 from PIL import Image, ImageFilter
 import cv2
+import httpx
 import numpy as np
 from utils.log import logger
 
@@ -104,45 +106,31 @@ def inpaint(
     try:
         image_bytes = image.file.read()
         mask_bytes = mask.file.read()
-
-        img_pil = Image.open(io.BytesIO(image_bytes))
-        mask_pil = Image.open(io.BytesIO(mask_bytes)).convert("L")
-
-        has_alpha = img_pil.mode == "RGBA"
-        orig_alpha = None
-        if has_alpha:
-            orig_alpha = img_pil.split()[3]
-            img_rgb = img_pil.convert("RGB")
-        else:
-            img_rgb = img_pil.convert("RGB")
-
-        if mask_pil.size != img_rgb.size:
-            mask_pil = mask_pil.resize(img_rgb.size, Image.Resampling.NEAREST)
-
-        img_np = np.array(img_rgb)
-        mask_np = np.array(mask_pil)
-
-        _, mask_bin = cv2.threshold(mask_np, 128, 255, cv2.THRESH_BINARY)
-
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        inpainted_bgr = cv2.inpaint(img_bgr, mask_bin, inpaintRadius=max(3, radius), flags=cv2.INPAINT_TELEA)
-        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-
-        result_pil = Image.fromarray(inpainted_rgb)
-        if has_alpha and orig_alpha:
-            result_pil.putalpha(orig_alpha)
-
-        buf = io.BytesIO()
-        result_pil.save(buf, format="PNG")
-        output = buf.getvalue()
+        # 蒙版修复由独立 LaMa 服务完成，代理仅转发原图与蒙版，不再用 OpenCV 纹理扩散。
+        response = httpx.post(
+            os.getenv("INPAINT_URL", "http://127.0.0.1:8011").rstrip("/") + "/inpaint",
+            files={"image": ("image.png", image_bytes, "image/png"),
+                   "mask": ("mask.png", mask_bytes, "image/png")},
+            data={"radius": str(radius)},
+            timeout=150.0,
+        )
+        response.raise_for_status()
+        output = response.content
+        if not output.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("LaMa 修复服务未返回 PNG 图片")
         logger.info("event=image_edit_finished operation=inpaint request_id=%s outcome=success duration_ms=%d input_bytes=%d mask_bytes=%d output_bytes=%d",
                     request_id, int((time.monotonic() - started) * 1000), len(image_bytes), len(mask_bytes), len(output))
         return Response(content=output, media_type="image/png", headers={"X-Request-ID": request_id})
+    except httpx.HTTPStatusError as e:
+        logger.error("event=image_edit_finished operation=inpaint request_id=%s outcome=failed duration_ms=%d reason_code=%s",
+                     request_id, int((time.monotonic() - started) * 1000), type(e).__name__)
+        status = e.response.status_code if e.response.status_code < 500 else 502
+        raise HTTPException(status_code=status, detail="LaMa 修复请求失败", headers={"X-Request-ID": request_id}) from e
     except Exception as e:
         logger.error("event=image_edit_finished operation=inpaint request_id=%s outcome=failed duration_ms=%d reason_code=%s",
                      request_id, int((time.monotonic() - started) * 1000), type(e).__name__)
-        raise HTTPException(status_code=500, detail=f"Inpainting failed: {str(e)}",
-                            headers={"X-Request-ID": request_id})
+        raise HTTPException(status_code=502, detail="LaMa 修复服务不可用",
+                            headers={"X-Request-ID": request_id}) from e
 
 
 MAX_UPSCALE_DIMENSION = 2560

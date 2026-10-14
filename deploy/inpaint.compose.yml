@@ -1,0 +1,14 @@
+services:
+  inpaint:
+    build: ../inpaint_service
+    image: flexi-lama-inpaint:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8011:8011"
+    environment:
+      TORCH_HOME: /models/torch
+    volumes:
+      - lama-models:/models
+
+volumes:
+  lama-models:

@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Package service
-        run: tar -czf chatgpt2api.tar.gz main.py api core providers utils pyproject.toml uv.lock README.md
+        run: tar -czf chatgpt2api.tar.gz main.py api core providers utils inpaint_service deploy/inpaint.compose.yml pyproject.toml uv.lock README.md
       - name: Configure SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}

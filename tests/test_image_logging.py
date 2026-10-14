@@ -81,6 +81,8 @@ def test_edits_log_completion(monkeypatch, operation, media_type, image_format):
             new_session=lambda *_args: object(), remove=lambda content, **_kwargs: content))
         response = edit.remove_bg(upload())
     elif operation == "inpaint":
+        monkeypatch.setattr(edit.httpx, "post", lambda *_args, **_kwargs: SimpleNamespace(
+            content=source.getvalue(), raise_for_status=lambda: None))
         response = edit.inpaint(upload(), upload(), radius=5)
     else:
         response = edit.upscale(upload(), scale=2)
@@ -92,6 +94,26 @@ def test_edits_log_completion(monkeypatch, operation, media_type, image_format):
     assert response.headers["X-Request-ID"]
     assert any(f"event=image_edit_finished operation={operation}" in call.args[0]
                for call in log_info.call_args_list)
+
+
+def test_inpaint_forwards_original_image_and_mask_to_lama(monkeypatch):
+    source = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(source, format="PNG")
+    mask = io.BytesIO()
+    Image.new("L", (4, 4), "white").save(mask, format="PNG")
+    sent = {}
+
+    def post(url, **kwargs):
+        sent.update(url=url, **kwargs)
+        return SimpleNamespace(content=source.getvalue(), raise_for_status=lambda: None)
+
+    monkeypatch.setattr(edit.httpx, "post", post)
+    edit.inpaint(UploadFile(file=io.BytesIO(source.getvalue())),
+                 UploadFile(file=io.BytesIO(mask.getvalue())), radius=5)
+    assert sent["url"].endswith("/inpaint")
+    assert sent["files"]["image"][1] == source.getvalue()
+    assert sent["files"]["mask"][1] == mask.getvalue()
+    assert sent["data"]["radius"] == "5"
 
 
 def test_gemini_closes_stream_after_image_candidate(monkeypatch):

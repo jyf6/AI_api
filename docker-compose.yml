@@ -25,6 +25,7 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD:-123456}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5174,http://127.0.0.1:5174}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      INPAINT_URL: http://inpaint:8011
       REMBG_HOME: /root/.rembg
       OSS_ACCESS_ID: ${OSS_ACCESS_ID}
       OSS_ACCESS_KEY: ${OSS_ACCESS_KEY}
@@ -37,6 +38,23 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  inpaint:
+    build: ./inpaint_service
+    image: flexi-lama-inpaint:local
+    restart: unless-stopped
+    environment:
+      TORCH_HOME: /models/torch
+    networks:
+      - scheduler-shared
+    volumes:
+      - lama-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 180s
+
 networks:
   scheduler-shared:
     external: true
@@ -44,3 +62,4 @@ networks:
 
 volumes:
   rembg-cache:
+  lama-models:

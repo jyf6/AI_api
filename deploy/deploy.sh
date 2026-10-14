@@ -16,11 +16,30 @@ fi
 test -f /etc/flexi/chatgpt2api.env
 test -f "$archive"
 test ! -e "$release"
+sudo -n docker info >/dev/null
+sudo -n docker compose version >/dev/null
 mkdir -p "$release"
 tar -xzf "$archive" -C "$release"
 
 cd "$release"
 /home/ubuntu/.local/bin/uv sync --locked --no-dev --no-install-project --python /usr/bin/python3.12
+
+# 主服务在宿主机运行，LaMa 容器仅向本机开放端口；先检查依赖再切换主服务。
+compose="$release/deploy/inpaint.compose.yml"
+sudo -n docker compose -p flexi-inpaint -f "$compose" up -d --build inpaint
+inpaint_ready=false
+for _ in $(seq 1 180); do
+  if curl -fs -o /dev/null http://127.0.0.1:8011/health; then
+    inpaint_ready=true
+    break
+  fi
+  sleep 5
+done
+if [ "$inpaint_ready" != true ]; then
+  sudo -n docker compose -p flexi-inpaint -f "$compose" logs --tail=100 inpaint >&2 || true
+  echo 'LaMa 服务检查失败，主服务保持当前版本' >&2
+  exit 1
+fi
 
 # 依赖安装成功后再切换版本；旧版本保留以便失败时回退。
 ln -sfn "$release" "$root/current.next"

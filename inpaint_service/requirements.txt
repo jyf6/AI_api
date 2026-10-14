@@ -1,0 +1,6 @@
+simple-lama-inpainting==0.1.2
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.20
+numpy==1.26.4
+opencv-python==4.11.0.86
