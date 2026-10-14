@@ -3,6 +3,7 @@ set -euo pipefail
 
 release_id="${1:?缺少发布版本号}"
 archive="${2:?缺少发布包路径}"
+image_archive="${3:?缺少 LaMa 镜像包路径}"
 [[ "$release_id" =~ ^[a-f0-9]{40}-[0-9]+-[0-9]+$ ]] || { echo '发布版本号格式错误' >&2; exit 1; }
 
 root=/opt/app/chatgpt2api
@@ -15,6 +16,7 @@ fi
 
 test -f /etc/flexi/chatgpt2api.env
 test -f "$archive"
+test -f "$image_archive"
 test ! -e "$release"
 sudo -n docker info >/dev/null
 sudo -n docker compose version >/dev/null
@@ -24,9 +26,11 @@ tar -xzf "$archive" -C "$release"
 cd "$release"
 /home/ubuntu/.local/bin/uv sync --locked --no-dev --no-install-project --python /usr/bin/python3.12
 
-# 主服务在宿主机运行，LaMa 容器仅向本机开放端口；先检查依赖再切换主服务。
+# 主服务在宿主机运行；镜像由 CI 构建，服务器无需访问 Docker Hub。
 compose="$release/deploy/inpaint.compose.yml"
-sudo -n docker compose -p flexi-inpaint -f "$compose" up -d --build inpaint
+gzip -dc "$image_archive" | sudo -n docker load
+rm -f "$image_archive"
+sudo -n docker compose -p flexi-inpaint -f "$compose" up -d --no-build --pull never --force-recreate inpaint
 inpaint_ready=false
 for _ in $(seq 1 180); do
   if curl -fs -o /dev/null http://127.0.0.1:8011/health; then

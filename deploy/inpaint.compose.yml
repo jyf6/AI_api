@@ -1,6 +1,5 @@
 services:
   inpaint:
-    build: ../inpaint_service
     image: flexi-lama-inpaint:local
     restart: unless-stopped
     ports:
