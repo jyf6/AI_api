@@ -1,5 +1,6 @@
 from __future__ import annotations
 from core.admission import mark_model_request_started
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 import asyncio
 
 import hashlib
@@ -68,7 +69,7 @@ class DoubaoBackendAPI:
     async def __aenter__(self):
         # 同一账号本次请求的所有上游调用共用 Chrome 传输模拟和绑定代理。
         self.session = AsyncSession(
-            cookies=self.cookies, proxy=self.proxy, impersonate="chrome136", timeout=300,
+            cookies=self.cookies, proxy=self.proxy, impersonate="chrome136", timeout=MODEL_TIMEOUT_SECONDS,
             headers={"User-Agent": self.USER_AGENT, "Origin": self.BASE_URL,
                      "Referer": self.BASE_URL + "/chat"},
         )

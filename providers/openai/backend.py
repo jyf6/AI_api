@@ -16,6 +16,7 @@ from curl_cffi import requests
 from utils.helper import ImageQuotaExceededError, ensure_ok, aiter_sse_payloads
 from core.blocking import run_blocking
 from core.admission import mark_model_request_started
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from utils.log import error_http_status, image_stage, logger
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
@@ -124,7 +125,7 @@ class OpenAIBackendAPI:
 
     async def _close_stream(self, response: requests.Response) -> None:
         # curl_cffi 0.16 的 aclose 只等待传输结束；主动移除未结束的句柄，
-        # 避免已拿到图片后仍等待剩余文本流或 300 秒网络超时。
+        # 避免已拿到图片后仍等待剩余文本流或四分钟网络超时。
         task = response.astream_task
         if task is not None and not task.done():
             self.session.acurl.remove_handle(response.curl)
@@ -345,7 +346,7 @@ class OpenAIBackendAPI:
                    "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 120,
                                                "page_height": 900, "page_width": 1400, "pixel_ratio": 2,
                                                "screen_height": 1440, "screen_width": 2560}}
-        response = await self._request("POST", self.base_url + path, headers=self._conversation_headers(path, reqs), json=payload, timeout=300, stream=True)
+        response = await self._request("POST", self.base_url + path, headers=self._conversation_headers(path, reqs), json=payload, timeout=MODEL_TIMEOUT_SECONDS, stream=True)
         ensure_ok(response, path)
         try:
             async for payload in aiter_sse_payloads(response):
@@ -482,7 +483,7 @@ class OpenAIBackendAPI:
                 self.base_url + path,
                 headers=self._image_headers(path, reqs, conduit_token, accept="text/event-stream"),
                 json=payload,
-                timeout=300,
+                timeout=MODEL_TIMEOUT_SECONDS,
                 stream=True,
             )
             ensure_ok(response, path)
@@ -678,7 +679,7 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return self._conversation_generated_image_asset_ids((response.json().get("mapping") or {}), excluded_file_ids)
 
-    async def _poll_image_asset_ids(self, conversation_id: str, timeout_secs: float = 120.0, expected_count: int = 1,
+    async def _poll_image_asset_ids(self, conversation_id: str, timeout_secs: float = MODEL_TIMEOUT_SECONDS, expected_count: int = 1,
                               excluded_file_ids: set[str] | None = None, initial_file_ids: list[str] | None = None,
                               initial_sediment_ids: list[str] | None = None) -> tuple[list[str], list[str]]:
         """轮询会话，直到 GPT 的生图工具输出可下载资产。"""

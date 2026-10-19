@@ -76,10 +76,13 @@ Docker 部署使用 `docker-compose.yml`；先启动共享网络中的 MySQL、R
 
 ### 3. Gemini Cookie 配置与模型
 
+GPT、Gemini、豆包的分析及生图，每次模型调用统一最多等待 **240 秒（4 分钟）**。提交、流式接收、轮询和图片取回共用预算；重试按新的一次尝试计时。Gemini 分析不再因正文停顿 10 秒而提前返回部分结果。Java 外层 300 秒用于容纳准入排队和素材准备，不代表模型单次等待 5 分钟。
+
 在控制台的“Gemini Web Cookie 账号”中粘贴 `gemini.google.com` Cookie（必须含 `__Secure-1PSID`，建议同时包含 `__Secure-1PSIDTS` 和完整 Cookie）。Gemini 账号独立保存为 `data/gemini_accounts.json`。
 
-- 文本/多模态：`POST /v1/chat/completions`，模型如 `gemini-3-flash`，当前只支持 `stream: false`。
-- 生图：`POST /v1/images/generations`，模型如 `gemini-2.5-pro-image`。
+- 文本/多模态分析：`POST /v1/chat/completions`，传 `model: "gemini-chat"`，统一使用账号清单中的 **3.8 Flash + 高思考（扩展思考）**，当前只支持 `stream: false`。
+- 生图及图片调整：`POST /v1/images/generations`，传 `model: "gemini-image"`，统一使用账号清单中的 **Pro + 高思考（扩展思考）**。
+- 模型名称/别名精确匹配后传入真实模型对象；不硬编码内部 ID，不将缺失的 3.8 Flash 替换成其他版本或默认模型。账号缺少目标模型或模型不可用时，请求明确失败。日志中的 `gemini_model_selected` 记录选定的名称、ID 和扩展思考开关，不记录 Cookie。
 - 失败时本次请求直接返回失败并降低所用 Gemini 账号状态，不自动切换其他账号。
 
 Gemini 通过项目内置的网页内部 HTTP 协议实现调用，不依赖 Playwright 或 Chromium。该实现保留了原始 GPL-3.0 许可证；使用或分发本服务前请审查其许可证条款。

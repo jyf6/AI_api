@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from api.schemas import ChatCompletionRequest
 from core.router import resolve_model
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from core.admission import CapacityUnavailable
 from api.model_execution import acquire_traced_account, execute_model_request
 from providers.doubao.account import doubao_account_service
@@ -252,7 +253,11 @@ async def _chat_completions_prepared(body: ChatCompletionRequest):
             # 账号池内部的状态事件复用当前尝试序号，便于区分就地重试。
             attempt_token = python_attempt_log_context.set(attempt + 1)
             try:
-                text = await _execute_chat_once(resolved, prompt, body.images, request_id, attempt + 1)
+                # 各平台每次尝试共用四分钟总预算，流式增量或重连不重新计时。
+                text = await asyncio.wait_for(
+                    _execute_chat_once(resolved, prompt, body.images, request_id, attempt + 1),
+                    timeout=MODEL_TIMEOUT_SECONDS,
+                )
             finally:
                 python_attempt_log_context.reset(attempt_token)
 

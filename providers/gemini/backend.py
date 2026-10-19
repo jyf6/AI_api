@@ -1,5 +1,6 @@
 from __future__ import annotations
 from core.admission import mark_model_request_started
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 
 import asyncio
 import contextlib
@@ -13,6 +14,21 @@ from curl_cffi.requests import AsyncSession
 from utils.log import error_http_status, image_stage, logger, stable_log_ref
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
+
+
+def _required_model(client: Any, name: str) -> Any:
+    """按账号真实清单精确选型，禁止版本模糊匹配或回退到默认模型。"""
+    for model in client.list_models() or []:
+        names = {model.model_name.lower(), model.display_name.lower(),
+                 *(alias.lower() for alias in model.aliases)}
+        if name.lower() not in names:
+            continue
+        if not model.is_available:
+            raise ValueError(f"Gemini 模型 {name} 当前不可用")
+        logger.info("event=gemini_model_selected requested_model=%s model=%s model_id=%s extended_thinking=true",
+                    name, model.display_name, model.model_id)
+        return model
+    raise ValueError(f"Gemini 账号模型清单中没有 {name}，不使用其他模型替代")
 
 
 def _inject_aspect_ratio(request_data: dict[str, Any], aspect_ratio: str) -> dict[str, Any]:
@@ -184,28 +200,27 @@ class GeminiBackendAPI:
 
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
-        client_model = None if model == "auto" else model
+        # 所有 Gemini 分析固定为 3.8 Flash 高思考；传模型对象绕过客户端的模糊名称解析。
+        client_model = _required_model(self.client, "gemini-3.8-flash")
         async with _prepare_reference_images(image_sources) as images:
             await mark_model_request_started()
-            stream = self.client.generate_content_stream(prompt, files=images or None, model=client_model)
+            stream = self.client.generate_content_stream(
+                prompt, files=images or None, model=client_model, extended_thinking=True
+            )
             text = ""
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + 120
+            deadline = loop.time() + MODEL_TIMEOUT_SECONDS
             try:
                 while True:
-                    # 首段最多等 120 秒；有文本后，仅新文本重置 10 秒兜底期限。
+                    # 正文、思考和重复帧均使用同一四分钟期限，不再十秒停顿就返回部分结果。
                     try:
                         output = await asyncio.wait_for(anext(stream), timeout=max(0, deadline - loop.time()))
                     except TimeoutError:
-                        if text.strip():
-                            logger.warning("event=analysis_stream_finished platform=gemini reason=idle_fallback idle_seconds=10")
-                            return text.strip()
-                        raise RuntimeError("Gemini did not return text within 120 seconds") from None
+                        raise RuntimeError(f"Gemini analysis timed out after {MODEL_TIMEOUT_SECONDS} seconds") from None
 
                     current_text = output.candidates[output.chosen].text if output.candidates else ""
                     if current_text and current_text != text:
                         text = current_text
-                        deadline = loop.time() + 10
                     # 明确完成优先于时间兜底；完成帧可以不带新增文本。
                     if output.is_completed:
                         if text.strip():
@@ -236,15 +251,16 @@ class GeminiBackendAPI:
         references: list[str] | None = None,
         aspect_ratio: str | None = None,
     ) -> list[bytes]:
+        # 初版、重刷及单张/整套调整均固定使用账号实际提供的 Pro 高思考。
+        client_model = _required_model(self.client, "gemini-pro")
         _configure_image_aspect_ratio(self.client, aspect_ratio)
-        client_model = None if model == "auto" else model
         try:
             async with _prepare_reference_images(references or []) as images:
                 generated = []
                 with image_stage("gemini", "generate"):
                     await mark_model_request_started()
                     stream = self.client.generate_content_stream(
-                        prompt, files=images or None, model=client_model
+                        prompt, files=images or None, model=client_model, extended_thinking=True
                     )
                     try:
                         async for output in stream:

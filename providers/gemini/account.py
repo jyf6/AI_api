@@ -10,6 +10,7 @@ from curl_cffi.requests import Cookies
 from core.account_pool import BaseAccountPool, serialized_account_edit
 from core.database import database
 from core.blocking import run_blocking
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from providers.gemini.webapi import AuthError
 from utils.helper import parse_cookie_string
 from utils.log import logger, stable_log_ref
@@ -331,7 +332,8 @@ class GeminiAccountPool(BaseAccountPool):
                 client.cookies = stored
             try:
                 await client.init(
-                    timeout=180,
+                    timeout=MODEL_TIMEOUT_SECONDS,
+                    watchdog_timeout=MODEL_TIMEOUT_SECONDS,
                     auto_refresh=True,
                     refresh_interval=_refresh_interval(),
                     impersonate="chrome145",
@@ -436,7 +438,8 @@ class GeminiAccountPool(BaseAccountPool):
         if cookies:
             client.cookies = cookies
         try:
-            await client.init(timeout=180, auto_refresh=False, impersonate="chrome145")
+            await client.init(timeout=MODEL_TIMEOUT_SECONDS, watchdog_timeout=MODEL_TIMEOUT_SECONDS,
+                              auto_refresh=False, impersonate="chrome145")
             if not client._check_account_status():
                 raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
             return client, generation

@@ -1,9 +1,17 @@
 import json
 import asyncio
+from types import SimpleNamespace
 
 from curl_cffi.requests import AsyncSession
 
 from providers.gemini.backend import GeminiBackendAPI, _configure_image_aspect_ratio, _inject_aspect_ratio
+
+
+def _models():
+    """比例和流生命周期测试使用具备业务指定模型的账号清单。"""
+    return [SimpleNamespace(model_name=name, display_name=name, aliases=[],
+                            model_id=name, is_available=True)
+            for name in ("gemini-3.8-flash", "gemini-pro")]
 
 
 def _request_data() -> dict[str, str]:
@@ -70,6 +78,7 @@ def test_image_returns_when_image_candidate_arrives_before_text_completion(monke
     stream = Stream()
     class Client:
         client = AsyncSession()
+        list_models = staticmethod(_models)
 
         def generate_content_stream(self, *_args, **_kwargs):
             return stream
@@ -93,6 +102,7 @@ def test_chat_returns_when_text_stream_finishes():
     class Output:
         candidates = [Candidate()]
         chosen = 0
+        is_completed = False
 
     class Stream:
         def __aiter__(self):
@@ -110,6 +120,8 @@ def test_chat_returns_when_text_stream_finishes():
     stream = Stream()
 
     class Client:
+        list_models = staticmethod(_models)
+
         def generate_content_stream(self, *_args, **_kwargs):
             return stream
 
@@ -128,6 +140,8 @@ def test_chat_keeps_received_text_when_stream_breaks_after_response():
     class Output:
         candidates = [Candidate()]
         chosen = 0
+        # 已完成的正文应立即返回，不再读取后续可能断开的帧。
+        is_completed = True
 
     class Stream:
         def __aiter__(self):
@@ -145,6 +159,8 @@ def test_chat_keeps_received_text_when_stream_breaks_after_response():
     stream = Stream()
 
     class Client:
+        list_models = staticmethod(_models)
+
         def generate_content_stream(self, *_args, **_kwargs):
             return stream
 

@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from api.schemas import ImageGenerationRequest
 from core.router import resolve_model
+from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from core.admission import CapacityUnavailable
 from api.model_execution import acquire_traced_account, execute_model_request
 from providers.doubao.account import doubao_account_service
@@ -234,7 +235,11 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
             # 账号池内部的健康变化日志也归到本次 Python 上游尝试。
             attempt_token = python_attempt_log_context.set(attempt + 1)
             try:
-                raw_image = await _generate_images_once(body, resolved, prompt, request_id, attempt + 1)
+                # 提交、结果轮询和取回图片共用四分钟，不能在每个阶段重新等待四分钟。
+                raw_image = await asyncio.wait_for(
+                    _generate_images_once(body, resolved, prompt, request_id, attempt + 1),
+                    timeout=MODEL_TIMEOUT_SECONDS,
+                )
             finally:
                 python_attempt_log_context.reset(attempt_token)
             media_type = image_media_type(raw_image) if isinstance(raw_image, (bytes, bytearray)) else None

@@ -1,8 +1,9 @@
-"""分析优先使用完成标记，只有无新增文本时才使用十秒兜底。"""
+"""分析优先使用完成标记，所有帧共用四分钟预算，超时不能冒充完整结果。"""
 
 import asyncio
 import contextlib
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import pytest
 from providers.gemini import backend as gemini
@@ -46,6 +47,10 @@ def setup(monkeypatch, stream):
     monkeypatch.setattr(gemini, "mark_model_request_started", AsyncMock())
     backend = object.__new__(gemini.GeminiBackendAPI)
     class Client:
+        def list_models(self):
+            return [SimpleNamespace(model_name="gemini-flash", display_name="3.8 Flash",
+                                    aliases=["gemini-3.8-flash"], model_id="flash-id", is_available=True)]
+
         def generate_content_stream(self, *args, **kwargs):
             return stream
     backend.client = Client()
@@ -67,7 +72,7 @@ def test_empty_completion_frame_retains_last_text(monkeypatch):
     assert stream.closed
 
 
-def test_idle_fallback_is_ten_seconds_and_duplicate_frames_do_not_reset_it(monkeypatch):
+def test_partial_and_duplicate_frames_do_not_reset_four_minute_budget(monkeypatch):
     stream = Stream([output("已有说明"), output("已有说明")])
     backend = setup(monkeypatch, stream)
     timeouts = []
@@ -82,9 +87,10 @@ def test_idle_fallback_is_ten_seconds_and_duplicate_frames_do_not_reset_it(monke
         return result
 
     monkeypatch.setattr(gemini.asyncio, "wait_for", wait_for)
-    assert asyncio.run(backend._do_chat("prompt", [], "auto")) == "已有说明"
-    assert 119 < timeouts[0] <= 120
-    assert 9 < timeouts[1] <= 10
+    with pytest.raises(RuntimeError, match="240 seconds"):
+        asyncio.run(backend._do_chat("prompt", [], "auto"))
+    assert 239 < timeouts[0] <= 240
+    assert 239 < timeouts[1] < timeouts[0]
     assert timeouts[2] < timeouts[1]
     assert stream.closed
 
@@ -108,10 +114,10 @@ def test_first_response_timeout_does_not_return_empty_result(monkeypatch):
     stream = Stream([])
     backend = setup(monkeypatch, stream)
     async def timeout(awaitable, timeout):
-        assert 119 < timeout <= 120
+        assert 239 < timeout <= 240
         awaitable.close()
         raise TimeoutError
     monkeypatch.setattr(gemini.asyncio, "wait_for", timeout)
-    with pytest.raises(RuntimeError, match="120 seconds"):
+    with pytest.raises(RuntimeError, match="240 seconds"):
         asyncio.run(backend._do_chat("prompt", [], "auto"))
     assert stream.closed
