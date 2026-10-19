@@ -17,4 +17,7 @@ def resolve_model(model_tag: str, expected_action: str) -> ResolvedModel:
         raise HTTPException(status_code=400, detail="模型标签必须为 platform-action") from exc
     if action != expected_action or platform not in {"gpt", "gemini", "doubao"}:
         raise HTTPException(status_code=400, detail="模型平台或动作类型不匹配")
-    return ResolvedModel(platform=platform, model="auto")
+    model = "auto"
+    if platform == "gpt":
+        model = "gpt-5-6-thinking" if action == "chat" else "gpt-6-thinking"
+    return ResolvedModel(platform=platform, model=model)

@@ -68,13 +68,13 @@ def is_json_response(text: str) -> bool:
     return False
 
 
-def is_anomalous_text(text: str) -> bool:
+def is_anomalous_text(text: str, stage: str) -> bool:
     """
     判断模型返回文本是否命中异常场景：
     1. 若为合法的 JSON 格式，直接放行（豁免字数拦截）；
-    2. 若包含【推荐产品图】等精简选品指令，直接放行（豁免 40 字下限拦截，防止 Phase 2B 误杀）；
+    2. 选图阶段的合法精简结果直接放行；
     3. 字数 < 40：判定为触发安全风控截断、连接异常中断、或模型误把分析当成生图导致文本极短；
-    4. 字数 > 4000：判定为模型出现严重冗余发散与幻觉。
+    4. 参考图与构图分析不设代理侧字数上限，其他阶段保留 4000 字上限。
     """
     if is_json_response(text):
         return False
@@ -82,7 +82,14 @@ def is_anomalous_text(text: str) -> bool:
     # 豁免【推荐产品图】选品指令，允许 1~39 字精简返回
     if "【推荐产品图】" in trimmed or "推荐产品图" in trimmed:
         return False
+    # 英文选图结果仅在对应阶段豁免长度下限，编号格式与后端解析约定一致。
+    if stage == "INITIAL_ITEM_PRODUCT_SELECTION" and re.fullmatch(
+        r"Selected product images:[ \t]*[0-9]+(?:[ \t]*[,，][ \t]*[0-9]+)*", trimmed
+    ):
+        return False
     text_len = len(trimmed)
+    if stage in {"INITIAL_ITEM_REF_ANALYSIS", "INITIAL_ITEM_COMPOSITION_PLANNING"}:
+        return text_len < 40
     return text_len < 40 or text_len > 4000
 
 
@@ -188,52 +195,20 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
 
 
 async def _chat_completions(body: ChatCompletionRequest):
-    """拼图只准备一次，模型重试复用；请求结束释放所有临时图片。"""
+    """多模态对话入口：初版多模态分析直接使用原始图片列表，无需在代理侧拼图。"""
     from utils.oss_reference import release_memory_references
     memory_keys = []
     try:
-        if body.reference_image_count and body.reference_image_count >= 2:
-            preparation = asyncio.create_task(asyncio.to_thread(_prepare_analysis_images, body, memory_keys))
-            try:
-                images = await asyncio.shield(preparation)
-            except asyncio.CancelledError:
-                # 等不可取消的下载线程结束，避免 finally 之后才写入内存导致泄漏。
-                await asyncio.gather(preparation, return_exceptions=True)
-                raise
-            except Exception as exc:
-                logger.warning("event=analysis_reference_prepare_failed request_id=%s reason_code=%s",
-                               body.request_id, type(exc).__name__)
-                raise HTTPException(status_code=502, detail="Reference image preparation failed",
-                                    headers={"X-Request-ID": body.request_id}) from exc
-            body = body.model_copy(update={"images": images})
         return await _chat_completions_prepared(body)
     finally:
         release_memory_references(memory_keys)
-
-
-def _prepare_analysis_images(body: ChatCompletionRequest, memory_keys: list[str]) -> list[str]:
-    """仅处理调用方明确标记的参考图，不混入产品九宫格。"""
-    from concurrent.futures import ThreadPoolExecutor
-    from utils.oss_reference import read_oss_reference, put_memory_reference
-    from utils.image_stitch import stitch_reference_sheets
-    count = body.reference_image_count
-    with ThreadPoolExecutor(max_workers=min(10, count)) as executor:
-        data = list(executor.map(lambda source: read_oss_reference(source, 768), body.images[:count]))
-    result = []
-    for sheet in stitch_reference_sheets(data):
-        key = put_memory_reference(sheet)
-        memory_keys.append(key)
-        result.append(key)
-    logger.info("event=analysis_references_prepared request_id=%s reference_count=%d sheet_count=%d",
-                body.request_id, count, len(result))
-    return result + body.images[count:]
 
 
 async def _chat_completions_prepared(body: ChatCompletionRequest):
     """
     多模态对话与分析接口：
     具备代理侧智能文本校验与就地自动重试机制。
-    针对非 JSON 格式的返回，如果字数 < 40（风控截断/误生图）或 > 4000（失控发散），自动在代理内就地重试 1 次。
+    针对非 JSON 格式的返回按阶段校验长度，异常时在代理内就地重试 1 次。
     """
     resolved = resolve_model(body.model, "chat")
     prompt = apply_analysis_constraint(body.prompt)
@@ -262,10 +237,13 @@ async def _chat_completions_prepared(body: ChatCompletionRequest):
                 python_attempt_log_context.reset(attempt_token)
 
             # 校验文本是否命中字数异常
-            if is_anomalous_text(text):
+            if is_anomalous_text(text, body.stage):
                 text_len = len(text.strip())
+                length_requirement = ("至少 40 字" if body.stage in {
+                    "INITIAL_ITEM_REF_ANALYSIS", "INITIAL_ITEM_COMPOSITION_PLANNING"
+                } else "40~4000 字")
                 anomaly_detail = (
-                    f"模型返回文本字数异常 (当前 {text_len} 字，要求 40~4000 字，"
+                    f"模型返回文本字数异常 (当前 {text_len} 字，要求 {length_requirement}，"
                     f"疑似风控拦截截断、要求出文字却误调用生图、或内容发散超长)"
                 )
                 if attempt < max_attempts - 1:

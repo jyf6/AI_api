@@ -38,6 +38,14 @@ _cache_timestamp: float = 0.0
 _CACHE_TTL: float = 1800.0  # 30 minutes
 
 
+def _model_parameters(model: str) -> dict[str, str]:
+    # 业务路由选择 Thinking 模型后统一使用扩展思考；账号探活仍使用 auto。
+    parameters = {"model": model}
+    if model.endswith("-thinking"):
+        parameters["thinking_effort"] = "extended"
+    return parameters
+
+
 @dataclass
 class ChatRequirements:
     token: str
@@ -337,7 +345,7 @@ class OpenAIBackendAPI:
         await self._bootstrap()
         reqs = await self._get_chat_requirements()
         path = "/backend-api/conversation"
-        payload = {"action": "next", "messages": await self._conversation_messages(messages), "model": model, "parent_message_id": str(uuid.uuid4()),
+        payload = {"action": "next", "messages": await self._conversation_messages(messages), **_model_parameters(model), "parent_message_id": str(uuid.uuid4()),
                    "conversation_mode": {"kind": "primary_assistant"}, "conversation_origin": None,
                    "force_paragen": False, "force_paragen_model_slug": "", "force_rate_limit": False,
                    "force_use_sse": True, "history_and_training_disabled": True, "reset_rate_limits": False,
@@ -392,7 +400,7 @@ class OpenAIBackendAPI:
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": str(uuid.uuid4()),
-            "model": model,
+            **_model_parameters(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -456,7 +464,7 @@ class OpenAIBackendAPI:
             "action": "next",
             "messages": [message],
             "parent_message_id": str(uuid.uuid4()),
-            "model": model,
+            **_model_parameters(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",

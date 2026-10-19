@@ -196,21 +196,18 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
             def process_images(images, stage):
                 with ThreadPoolExecutor(max_workers=min(10, len(images))) as executor:
                     dimensions = [2048] * len(images)
-                    if len(images) > 2 and stage == "INITIAL_IMAGE_GENERATION":
-                        dimensions = [768] * len(images)
-                    elif len(images) > 2 and stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
+                    # 仅在单图调整和套图批量调整中，若参考图大于1张，则对参考图按 768 尺寸读取以准备拼图
+                    if len(images) > 2 and stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
                         dimensions = [2048] + [768] * (len(images) - 1)
                     bytes_list = list(executor.map(read_oss_reference, images, dimensions))
                     
-                if len(images) > 2:
-                    if stage == "INITIAL_IMAGE_GENERATION":
-                        stitched = stitch_images_to_bytes(bytes_list)
-                        return [remember(stitched)]
-                    elif stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
-                        base_img_bytes = bytes_list[0]
-                        stitched = stitch_images_to_bytes(bytes_list[1:])
-                        return [remember(base_img_bytes), remember(stitched)]
+                # 仅针对单图与套图调整阶段进行控图拼接（第1张基底图保持独立，第2~N张参考图拼为一张）
+                if len(images) > 2 and stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
+                    base_img_bytes = bytes_list[0]
+                    stitched = stitch_images_to_bytes(bytes_list[1:])
+                    return [remember(base_img_bytes), remember(stitched)]
                         
+                # 初版生图 (INITIAL_IMAGE_GENERATION) 或未超限图片直接保持独立原图
                 return [remember(b) for b in bytes_list]
                 
             preparation = asyncio.create_task(asyncio.to_thread(process_images, body.images, body.stage))

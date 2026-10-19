@@ -83,6 +83,10 @@ class GeminiAccountPool(BaseAccountPool):
     """Gemini 账号池：续期交给 Gemini-API，代理只验证并持久化续期结果。"""
 
     PROVIDER_NAME = "Gemini"
+    # 单账号并发提升为 4 个生成图片和 4 个分析，总并发上限提升为 8
+    MAX_INFLIGHT_IMAGE: int = 4
+    MAX_INFLIGHT_CHAT: int = 4
+    MAX_INFLIGHT_TOTAL: int = 8
 
     @staticmethod
     def _client_ready(client: Any) -> bool:

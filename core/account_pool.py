@@ -54,10 +54,23 @@ class BaseAccountPool:
     Subclasses override hooks to customize behavior per provider.
     """
 
+    MAX_INFLIGHT_IMAGE: int = 4
+    MAX_INFLIGHT_CHAT: int = 4
     MAX_INFLIGHT_TOTAL: int = 4
     MIN_DISPATCH_INTERVAL_SECONDS: float = 1.0
     RATE_LIMIT_COOLDOWN_SECONDS: int = 300
     PROVIDER_NAME: str = "base"
+
+
+    def _account_has_capacity(self, account: dict[str, Any], norm_type: str = "chat") -> bool:
+        """检查账号是否具有当前任务类型（image/chat）及全局总并发的可用配额。"""
+        if not self._account_has_capacity(account, norm_type):
+            return False
+        if norm_type == "image" and account.get("inflight_image", 0) >= self.MAX_INFLIGHT_IMAGE:
+            return False
+        if norm_type == "chat" and account.get("inflight_chat", 0) >= self.MAX_INFLIGHT_CHAT:
+            return False
+        return True
 
     def __init__(self, data_file: Path | None = None, platform: str = "") -> None:
         self._lock = Lock()
@@ -393,7 +406,7 @@ class BaseAccountPool:
                 now = time.time()
                 deadlines = []
                 for candidate in self._accounts.values():
-                    if candidate.get("status") not in {"active", "cooldown"} or candidate.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
+                    if candidate.get("status") not in {"active", "cooldown"} or not self._account_has_capacity(candidate, "image" if task_type == "image" else "chat"):
                         continue
                     deadline = max(
                         float(candidate.get("cooldown_until", 0)),
