@@ -82,11 +82,11 @@ def is_anomalous_text(text: str, stage: str) -> bool:
     # 豁免【推荐产品图】选品指令，允许 1~39 字精简返回
     if "【推荐产品图】" in trimmed or "推荐产品图" in trimmed:
         return False
-    # 英文选图结果仅在对应阶段豁免长度下限，编号格式与后端解析约定一致。
-    if stage == "INITIAL_ITEM_PRODUCT_SELECTION" and re.fullmatch(
-        r"Selected product images:[ \t]*[0-9]+(?:[ \t]*[,，][ \t]*[0-9]+)*", trimmed
-    ):
-        return False
+    # 与 Java 协议同步：完整 None 也是成功空选择；混杂解释不能靠字数绕过校验。
+    if stage == "INITIAL_ITEM_PRODUCT_SELECTION" and trimmed.startswith("Selected product images:"):
+        return re.fullmatch(
+            r"Selected product images:(?: None|[ \t]*[0-9]+(?:[ \t]*[,，][ \t]*[0-9]+)*)", trimmed
+        ) is None
     text_len = len(trimmed)
     if stage in {"INITIAL_ITEM_REF_ANALYSIS", "INITIAL_ITEM_COMPOSITION_PLANNING"}:
         return text_len < 40

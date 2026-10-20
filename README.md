@@ -87,9 +87,10 @@ GPT、Gemini、豆包的分析及生图，每次模型调用统一最多等待 *
 
 在控制台的“Gemini Web Cookie 账号”中粘贴 `gemini.google.com` Cookie（必须含 `__Secure-1PSID`，建议同时包含 `__Secure-1PSIDTS` 和完整 Cookie）。Gemini 账号独立保存为 `data/gemini_accounts.json`。
 
-- 文本/多模态分析：`POST /v1/chat/completions`，传 `model: "gemini-chat"`，统一使用账号清单中的 **3.8 Flash + 高思考（扩展思考）**，当前只支持 `stream: false`。
+- 文本/多模态分析：`POST /v1/chat/completions`，传 `model: "gemini-chat"`，统一使用账号清单中的 **3.8 Flash + 中档思考（Medium）**，当前只支持 `stream: false`。
 - 生图及图片调整：`POST /v1/images/generations`，传 `model: "gemini-image"`，统一使用账号清单中的 **Pro + 高思考（扩展思考）**。
-- 模型名称/别名精确匹配后传入真实模型对象；不硬编码内部 ID，不将缺失的 3.8 Flash 替换成其他版本或默认模型。账号缺少目标模型或模型不可用时，请求明确失败。日志中的 `gemini_model_selected` 记录选定的名称、ID 和扩展思考开关，不记录 Cookie。
+- 内部网页客户端保留高档能力：`thinking_level="medium"` / `"high"` 可明确选择档位；未传时兼容原有 `extended_thinking` 参数。中档使用已实测的完整请求字段，接口分析调用固定中档，生图仍沿用高档参数。
+- 模型名称/别名精确匹配后传入真实模型对象；不硬编码内部 ID，不将缺失的 3.8 Flash 替换成其他版本或默认模型。账号缺少目标模型或模型不可用时，请求明确失败。日志中的 `gemini_model_selected` 记录选定的名称、ID 和 `thinking_level`，不记录 Cookie。
 - 失败时本次请求直接返回失败并降低所用 Gemini 账号状态，不自动切换其他账号。
 
 Gemini 通过项目内置的网页内部 HTTP 协议实现调用，不依赖 Playwright 或 Chromium。该实现保留了原始 GPL-3.0 许可证；使用或分发本服务前请审查其许可证条款。

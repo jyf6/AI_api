@@ -23,7 +23,7 @@ from providers.gemini.webapi.types import RPCData
 from providers.gemini.webapi.utils import extract_json_from_response, get_nested_value
 
 
-def _required_model(client: Any, name: str) -> Any:
+def _required_model(client: Any, name: str, *, thinking_level: str = "high") -> Any:
     """按账号真实清单精确选型，禁止版本模糊匹配或回退到默认模型。"""
     for model in client.list_models() or []:
         names = {model.model_name.lower(), model.display_name.lower(),
@@ -32,8 +32,8 @@ def _required_model(client: Any, name: str) -> Any:
             continue
         if not model.is_available:
             raise ValueError(f"Gemini 模型 {name} 当前不可用")
-        logger.info("event=gemini_model_selected requested_model=%s model=%s model_id=%s extended_thinking=true",
-                    name, model.display_name, model.model_id)
+        logger.info("event=gemini_model_selected requested_model=%s model=%s model_id=%s thinking_level=%s",
+                    name, model.display_name, model.model_id, thinking_level)
         return model
     raise ValueError(f"Gemini 账号模型清单中没有 {name}，不使用其他模型替代")
 
@@ -251,11 +251,11 @@ class GeminiBackendAPI:
 
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
-        # 所有 Gemini 分析固定为 3.8 Flash 高思考；传模型对象绕过客户端的模糊名称解析。
-        client_model = _required_model(self.client, "gemini-3.8-flash")
+        # 所有 Gemini 文本/参考图分析固定为 3.8 Flash 中档思考；传模型对象绕过客户端的模糊名称解析。
+        client_model = _required_model(self.client, "gemini-3.8-flash", thinking_level="medium")
         async with _prepare_reference_images(image_sources) as images:
             stream = self.client.generate_content_stream(
-                prompt, files=images or None, model=client_model, extended_thinking=True
+                prompt, files=images or None, model=client_model, thinking_level="medium"
             )
             text = ""
             loop = asyncio.get_running_loop()

@@ -24,3 +24,13 @@ def test_short_english_product_selection_is_allowed_only_at_selection_stage():
 def test_short_invalid_text_and_existing_json_exemption_remain():
     assert is_anomalous_text("Oops", "INITIAL_ITEM_REF_ANALYSIS")
     assert not is_anomalous_text('{"value": 1}', "INITIAL_GLOBAL_ANALYSIS")
+
+
+def test_explicit_empty_product_selection_is_allowed_only_in_selection_stage():
+    # 与 Java 单行协议一致：只有完整 None 是合法空选择，不能放过格式错误。
+    selection = "Selected product images: None"
+    assert not is_anomalous_text(selection, "INITIAL_ITEM_PRODUCT_SELECTION")
+    assert is_anomalous_text(selection, "INITIAL_ITEM_COMPOSITION_PLANNING")
+    for invalid in ("None", "Selected product images: none", "Selected product images: []",
+                    "Selected product images: None, 1", "Selected product images: None because no product"):
+        assert is_anomalous_text(invalid, "INITIAL_ITEM_PRODUCT_SELECTION")

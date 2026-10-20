@@ -13,7 +13,7 @@ from collections.abc import AsyncGenerator, Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from textwrap import shorten
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import orjson as json
 from curl_cffi.requests import AsyncSession, BrowserTypeLiteral, Cookies, Response
@@ -1120,6 +1120,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         temporary: bool = False,
         deep_research: bool = False,
         extended_thinking: bool = False,
+        thinking_level: Literal["medium", "high"] | None = None,
         **kwargs,
     ) -> ModelOutput:
         """Generates contents with prompt.
@@ -1147,6 +1148,9 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
             If set to `True`, will enable deep research mode and start creating a deep research plan.
         extended_thinking: `bool`, optional
             If set to `True`, will enable extended thinking mode, default to standard.
+        thinking_level: `str`, optional
+            Explicit "medium" or "high" thinking, overriding extended_thinking.
+            Omit to retain the existing standard/extended boolean behavior.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
             Refer to `curl_cffi.requests.AsyncSession.request` for more information.
@@ -1213,6 +1217,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 session_state=session_state,
                 deep_research=deep_research,
                 extended_thinking=extended_thinking,
+                thinking_level=thinking_level,
                 **kwargs,
             ):
                 output = chunk
@@ -1242,6 +1247,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         temporary: bool = False,
         deep_research: bool = False,
         extended_thinking: bool = False,
+        thinking_level: Literal["medium", "high"] | None = None,
         **kwargs,
     ) -> AsyncGenerator[ModelOutput, None]:
         """Generates contents with prompt in streaming mode.
@@ -1271,6 +1277,9 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
             If set to `True`, will enable deep research mode and start creating a deep research plan.
         extended_thinking: `bool`, optional
             If set to `True`, will enable extended thinking mode, default to standard.
+        thinking_level: `str`, optional
+            Explicit "medium" or "high" thinking, overriding extended_thinking.
+            Omit to retain the existing standard/extended boolean behavior.
         kwargs: `dict`, optional
             Additional arguments passed to `curl_cffi.requests.AsyncSession.stream`.
 
@@ -1332,6 +1341,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 session_state=session_state,
                 deep_research=deep_research,
                 extended_thinking=extended_thinking,
+                thinking_level=thinking_level,
                 **kwargs,
             )) as generation_stream:
                 # 外层提前收图或取消时，立即关闭底层生成器及HTTP流。
@@ -1360,6 +1370,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         session_state: dict[str, Any] | None = None,
         deep_research: bool = False,
         extended_thinking: bool = False,
+        thinking_level: Literal["medium", "high"] | None = None,
         **kwargs,
     ) -> AsyncGenerator[ModelOutput, None]:
         """Internal method which actually sends content generation requests.
@@ -1371,6 +1382,11 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
         repeated scans of large cumulative response frames.
         """
         assert prompt, "Prompt cannot be empty."
+        if thinking_level not in (None, "medium", "high"):
+            raise ValueError("thinking_level must be 'medium', 'high', or None")
+        thinking_wire = 2 if extended_thinking else 1
+        if thinking_level is not None:
+            thinking_wire = 4 if thinking_level == "medium" else 2
 
         # Resolved down to one of two things: a model this account offers, or None for "let
         # Google pick", so nothing below has to know which form the caller passed.
@@ -1444,7 +1460,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
 
         while True:
             try:
-                inner_req_list: list[Any] = [None] * 81
+                inner_req_list: list[Any] = [None] * (97 if thinking_level == "medium" else 81)
                 inner_req_list[0] = message_content
                 inner_req_list[1] = [self.language]
                 inner_req_list[2] = chat.metadata if chat else DEFAULT_METADATA
@@ -1473,7 +1489,11 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 inner_req_list[61] = []
                 inner_req_list[68] = 1
                 inner_req_list[79] = 1
-                inner_req_list[80] = 2 if extended_thinking else 1
+                inner_req_list[80] = thinking_wire
+                if thinking_level == "medium":
+                    # Use the complete Medium request shape verified against the web service.
+                    inner_req_list[91] = 0
+                    inner_req_list[96] = 1
 
                 uuid_val = str(uuid.uuid4()).upper()
 
@@ -1485,7 +1505,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     model_number = model_header[-1] if model_header else None
                     if isinstance(model_number, int):
                         inner_req_list[79] = model_number
-                    model_header.append(2 if extended_thinking else 1)
+                    model_header.append(thinking_wire)
                     model_header.append(self._sessionid)
                     model_headers[MODEL_HEADER_KEY] = json.dumps(model_header).decode("utf-8")
 
@@ -2434,6 +2454,7 @@ class ChatSession:
         temporary: bool = False,
         deep_research: bool = False,
         extended_thinking: bool = False,
+        thinking_level: Literal["medium", "high"] | None = None,
         **kwargs,
     ) -> ModelOutput:
         """Generates contents with prompt.
@@ -2453,6 +2474,9 @@ class ChatSession:
             If set to `True`, will enable deep research mode and start creating a deep research plan.
         extended_thinking: `bool`, optional
             If set to `True`, will enable extended thinking mode, default to standard.
+        thinking_level: `str`, optional
+            Explicit "medium" or "high" thinking, overriding extended_thinking.
+            Omit to retain the existing standard/extended boolean behavior.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
             Refer to `curl_cffi.requests.AsyncSession.request` for more information.
@@ -2484,6 +2508,7 @@ class ChatSession:
             temporary=temporary,
             deep_research=deep_research,
             extended_thinking=extended_thinking,
+            thinking_level=thinking_level,
             **kwargs,
         )
 
@@ -2494,6 +2519,7 @@ class ChatSession:
         temporary: bool = False,
         deep_research: bool = False,
         extended_thinking: bool = False,
+        thinking_level: Literal["medium", "high"] | None = None,
         **kwargs,
     ) -> AsyncGenerator[ModelOutput, None]:
         """Generates contents with prompt in streaming mode within this chat session.
@@ -2515,6 +2541,9 @@ class ChatSession:
             If set to `True`, will enable deep research mode and start creating a deep research plan.
         extended_thinking: `bool`, optional
             If set to `True`, will enable extended thinking mode, default to standard.
+        thinking_level: `str`, optional
+            Explicit "medium" or "high" thinking, overriding extended_thinking.
+            Omit to retain the existing standard/extended boolean behavior.
         kwargs: `dict`, optional
             Additional arguments passed to the streaming request.
 
@@ -2533,6 +2562,7 @@ class ChatSession:
             temporary=temporary,
             deep_research=deep_research,
             extended_thinking=extended_thinking,
+            thinking_level=thinking_level,
             **kwargs,
         ):
             yield output
