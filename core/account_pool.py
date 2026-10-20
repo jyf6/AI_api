@@ -19,6 +19,10 @@ class AccountWaitCancelled(Exception):
     """等待中的请求已取消，账号尚未交给业务调用。"""
 
 
+class AccountUnavailable(RuntimeError):
+    """指定账号需要人工恢复或已移除，调用侧应更换账号。"""
+
+
 T = TypeVar("T")
 
 
@@ -64,7 +68,7 @@ class BaseAccountPool:
 
     def _account_has_capacity(self, account: dict[str, Any], norm_type: str = "chat") -> bool:
         """检查账号是否具有当前任务类型（image/chat）及全局总并发的可用配额。"""
-        if not self._account_has_capacity(account, norm_type):
+        if account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL:
             return False
         if norm_type == "image" and account.get("inflight_image", 0) >= self.MAX_INFLIGHT_IMAGE:
             return False
@@ -351,13 +355,21 @@ class BaseAccountPool:
 
     # ── Scheduling ──
 
-    def _reserve_available_account(self, task_type: str) -> dict[str, Any] | None:
+    def _reserve_available_account(self, task_type: str, account_id: int | None = None,
+                                   excluded_account_ids: set[int] | None = None) -> dict[str, Any] | None:
         norm_type = "image" if task_type == "image" else "chat"
         now = time.time()
         self._restore_expired_cooldowns(now)
         candidates = []
         for account in self._accounts.values():
-            if account.get("status") != "active" or account.get("proxy_status") == "disabled" or account.get("inflight", 0) >= self.MAX_INFLIGHT_TOTAL or not self._account_ready(account):
+            if account_id is not None and account.get("account_id") != account_id:
+                continue
+            if account.get("account_id") in (excluded_account_ids or ()):
+                continue
+            if account.get("status") != "active" or account.get("proxy_status") == "disabled" or not self._account_has_capacity(account, norm_type):
+                continue
+            # 定向账号允许在领取后执行自动刷新；人工失效已在领取入口排除。
+            if account_id is None and not self._account_ready(account):
                 continue
             if self._batches.get(account.get("name") or account.get("email"), {}).get("probing"):
                 continue
@@ -418,7 +430,9 @@ class BaseAccountPool:
                 timeout = max(0.01, min(deadlines) - now) if deadlines else None
                 self._condition.wait(timeout)
 
-    async def acquire_account(self, task_type: str = "chat", deadline: float | None = None) -> dict[str, Any]:
+    async def acquire_account(self, task_type: str = "chat", deadline: float | None = None,
+                              *, account_id: int | None = None,
+                              excluded_account_ids: set[int] | None = None) -> dict[str, Any]:
         """Wait without blocking a worker thread; reservation and cancellation cannot interleave."""
         loop = asyncio.get_running_loop()
         permit = current_permit.get()
@@ -428,6 +442,8 @@ class BaseAccountPool:
             await permit.begin_account_wait()
         try:
             while True:
+                if account_id is not None and not self.account_is_recoverable(account_id):
+                    raise AccountUnavailable("Bound account requires manual recovery")
                 if loop.time() >= deadline:
                     with self._condition:
                         failure = self._account_wait_failure()
@@ -435,17 +451,24 @@ class BaseAccountPool:
                 if permit is not None:
                     await permit.ensure_reserved(deadline)
                 with self._condition:
-                    account = self._reserve_available_account(task_type)
+                    account = (self._reserve_available_account(task_type)
+                               if account_id is None and not excluded_account_ids
+                               else self._reserve_available_account(task_type, account_id, excluded_account_ids))
                     healthy = any(
                         candidate.get("status") in {"active", "cooldown"}
                         and candidate.get("proxy_status") != "disabled"
+                        and candidate.get("account_id") not in (excluded_account_ids or ())
                         for candidate in self._accounts.values()
                     )
                 if account is not None:
                     try:
                         return await self._prepare_account_async(account)
-                    except BaseException:
+                    except BaseException as exc:
                         self.release_account(account.get("name") or account.get("email"), False, task_type=task_type, acquired_account=account)
+                        # 首次选中的账号也可能在自动刷新时确认失效，交给槽位调用侧继续换号。
+                        if (isinstance(exc, Exception) and account.get("account_id") is not None
+                                and not self.account_is_recoverable(account["account_id"])):
+                            raise AccountUnavailable("Selected account requires manual recovery") from exc
                         raise
                 if not healthy:
                     raise CapacityUnavailable("NO_HEALTHY_ACCOUNT")
@@ -456,6 +479,42 @@ class BaseAccountPool:
         finally:
             if permit is not None:
                 await permit.end_account_wait()
+
+    def account_is_recoverable(self, account_id: int) -> bool:
+        """只判断账号能否自动恢复，忙碌与冷却不属于失效。"""
+        with self._lock:
+            return any(account.get("account_id") == account_id
+                       and account.get("status") in {"active", "cooldown"}
+                       and account.get("proxy_status") != "disabled"
+                       and account.get("error_message") != "credential_auth_invalid"
+                       for account in self._accounts.values())
+
+    async def wait_for_model_send(self, account: dict[str, Any]) -> None:
+        """所有请求客户端共用账号发送门槛，分析和生图在实际POST之前计时。"""
+        key = account.get("account_id") or account.get("name") or account["email"]
+        locks = self.__dict__.setdefault("_model_send_locks", {})
+        times = self.__dict__.setdefault("_model_send_times", {})
+        loop = asyncio.get_running_loop()
+        permit = current_permit.get()
+        deadline = (permit.deadline if permit is not None and not permit.upstream_started
+                    and permit.deadline is not None else loop.time() + 30)
+        async with locks.setdefault(key, asyncio.Lock()):
+            while True:
+                # 领取后其他在途请求仍可能触发冷却，发送前必须使用池中最新状态。
+                if account.get("account_id") is not None and not self.account_is_recoverable(account["account_id"]):
+                    raise AccountUnavailable("Account became unavailable before model send")
+                with self._lock:
+                    current = next((candidate for candidate in self._accounts.values()
+                                    if candidate.get("account_id") == account.get("account_id")), account)
+                    cooldown = current.get("cooldown_until", 0) - time.time()
+                remaining = max(cooldown, times.get(key, 0) + self.MIN_DISPATCH_INTERVAL_SECONDS - loop.time())
+                if remaining <= 0:
+                    break
+                budget = deadline - loop.time()
+                if budget <= 0:
+                    raise CapacityUnavailable()
+                await asyncio.sleep(min(remaining, budget, .25))
+            times[key] = loop.time()
 
     def _account_wait_failure(self) -> Exception:
         """普通账号忙返回容量错误；平台可区分自己的凭证准备失败。"""

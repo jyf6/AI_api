@@ -103,7 +103,7 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
                     request_id, attempt, account_ref, proxy_ref)
         upstream_started = time.monotonic()
         try:
-            async with GeminiBackendAPI(account) as backend:
+            async with GeminiBackendAPI(account, before_model_send=lambda: gemini_account_service.wait_for_model_send(account)) as backend:
                 text = await backend.chat(prompt, images, resolved.model)
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gemini account_ref=%s proxy_ref=%s duration_ms=%d",
                         request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000))
@@ -162,7 +162,8 @@ async def _execute_chat_once(resolved: Any, prompt: str, images: list[str], requ
         upstream_started = time.monotonic()
         try:
             async with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", ""),
-                    credential_provider=lambda: account_service.prepare_request_account(account)) as backend:
+                    credential_provider=lambda: account_service.prepare_request_account(account),
+                    before_model_send=lambda: account_service.wait_for_model_send(account)) as backend:
                 text = await backend.chat_text(prompt, images, resolved.model)
             account_service.release_account(account["email"], True, task_type="chat", acquired_account=account)
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gpt account_ref=%s proxy_ref=%s duration_ms=%d",

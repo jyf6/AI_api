@@ -17,6 +17,7 @@ from utils.helper import ImageQuotaExceededError, ensure_ok, aiter_sse_payloads
 from core.blocking import run_blocking
 from core.admission import mark_model_request_started
 from core.model_timeout import MODEL_TIMEOUT_SECONDS
+from core.slot_sessions import ConversationUnavailable
 from utils.log import error_http_status, image_stage, logger
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
@@ -57,8 +58,10 @@ class ChatRequirements:
 class OpenAIBackendAPI:
     """ChatGPT reverse client with per-account proxy binding and zero-storage image output."""
 
-    def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "", credential_provider=None) -> None:
+    def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "", credential_provider=None,
+                 before_model_send=None) -> None:
         self.credential_provider = credential_provider
+        self.before_model_send = before_model_send
         self.access_token = access_token.strip()
         self.proxy = proxy.strip()
         self.base_url = "https://chatgpt.com"
@@ -128,6 +131,8 @@ class OpenAIBackendAPI:
             if method == "POST" and url in {
                 self.base_url + "/backend-api/conversation", self.base_url + "/backend-api/f/conversation"
             }:
+                if self.before_model_send is not None:
+                    await self.before_model_send()
                 await mark_model_request_started()
         return await getattr(self.session, method.lower())(url, **kwargs)
 
@@ -399,7 +404,7 @@ class OpenAIBackendAPI:
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": str(uuid.uuid4()),
+            "parent_message_id": self._image_parent_message_id,
             **_model_parameters(model),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
@@ -415,6 +420,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if self._image_conversation_id:
+            payload["conversation_id"] = self._image_conversation_id
         response = await self._request("POST",
             self.base_url + path,
             headers=self._image_headers(path, reqs),
@@ -445,7 +452,7 @@ class OpenAIBackendAPI:
         parts.append(prompt)
 
         message = {
-            "id": str(uuid.uuid4()),
+            "id": self._image_request_message_id,
             "author": {"role": "user"},
             "create_time": time.time(),
             "content": {"content_type": "multimodal_text" if attachments else "text", "parts": parts},
@@ -463,7 +470,7 @@ class OpenAIBackendAPI:
         payload = {
             "action": "next",
             "messages": [message],
-            "parent_message_id": str(uuid.uuid4()),
+            "parent_message_id": self._image_parent_message_id,
             **_model_parameters(model),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
@@ -486,6 +493,8 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if self._image_conversation_id:
+            payload["conversation_id"] = self._image_conversation_id
         with image_stage("gpt", "generate_submit"):
             response = await self._request("POST",
                 self.base_url + path,
@@ -685,7 +694,23 @@ class OpenAIBackendAPI:
         path = f"/backend-api/conversation/{conversation_id}"
         response = await self._request("GET", self.base_url + path, headers=self._headers(path), timeout=30)
         ensure_ok(response, path)
-        return self._conversation_generated_image_asset_ids((response.json().get("mapping") or {}), excluded_file_ids)
+        mapping = response.json().get("mapping") or {}
+        request_id = getattr(self, "_image_request_message_id", "")
+        if request_id:
+            # 只提取本次用户消息的后代，禁止取会话中的历史图片补结果。
+            children = {}
+            for node_id, node in mapping.items():
+                children.setdefault(node.get("parent"), []).append(node_id)
+                children.setdefault(node_id, []).extend(node.get("children") or [])
+            selected, pending = set(), [request_id]
+            while pending:
+                node_id = pending.pop()
+                if node_id in selected:
+                    continue
+                selected.add(node_id)
+                pending.extend(children.get(node_id, []))
+            mapping = {key: node for key, node in mapping.items() if key in selected}
+        return self._conversation_generated_image_asset_ids(mapping, excluded_file_ids)
 
     async def _poll_image_asset_ids(self, conversation_id: str, timeout_secs: float = MODEL_TIMEOUT_SECONDS, expected_count: int = 1,
                               excluded_file_ids: set[str] | None = None, initial_file_ids: list[str] | None = None,
@@ -739,7 +764,7 @@ class OpenAIBackendAPI:
         return data.get("download_url") or data.get("url") or ""
 
     async def delete_conversation_async(self, conversation_id: str) -> None:
-        """Asynchronously delete temporary conversation to keep account clean."""
+        """隐藏指定会话；生图完成后不自动调用，不代表永久删除。"""
         if not conversation_id:
             return
 
@@ -753,10 +778,24 @@ class OpenAIBackendAPI:
         except Exception as exc:
             logger.warning("GPT conversation cleanup failed reason=%s", type(exc).__name__)
 
-    async def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None, expected_count: int = 1) -> bytes | list[bytes]:
+    async def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None,
+                                   expected_count: int = 1, *, conversation_ref: dict | None = None,
+                                   on_conversation=None) -> bytes | list[bytes]:
         """Main entry: zero-storage in-memory image generation."""
         if not self.access_token:
             raise ValueError("access_token is required for image generation")
+
+        # 续接节点只存在本次适配器中，不进入业务槽位或图片记录。
+        self._image_request_message_id = str(uuid.uuid4())
+        self._image_parent_message_id = str(uuid.uuid4())
+        self._image_conversation_id = conversation_ref["conversationId"] if conversation_ref else ""
+        if self._image_conversation_id:
+            path = f"/backend-api/conversation/{self._image_conversation_id}"
+            response = await self._request("GET", self.base_url + path, headers=self._headers(path), timeout=30)
+            if response.status_code in {404, 410}:
+                raise ConversationUnavailable("Previous GPT conversation is no longer accessible")
+            ensure_ok(response, path)
+            self._image_parent_message_id = response.json()["current_node"]
 
         # 1. Warm up PoW resources (cached)
         with image_stage("gpt", "bootstrap"):
@@ -793,8 +832,10 @@ class OpenAIBackendAPI:
                         event_conversation_id, found_files, found_sediments = self._sse_image_asset_ids(
                             event, reference_file_ids,
                         )
-                        if event_conversation_id:
+                        if event_conversation_id and event_conversation_id != conversation_id:
                             conversation_id = event_conversation_id
+                            if on_conversation is not None:
+                                await on_conversation({"conversationId": conversation_id})
                         for asset_id in found_files:
                             if asset_id not in sse_file_ids:
                                 sse_file_ids.append(asset_id)
@@ -825,7 +866,6 @@ class OpenAIBackendAPI:
         if not conversation_id:
             raise RuntimeError("Upstream SSE did not return conversation_id")
 
-        completed = False
         try:
             # 5. Poll for image file IDs
             with image_stage("gpt", "result_poll"):
@@ -856,9 +896,7 @@ class OpenAIBackendAPI:
                         raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
                     images.append(img_resp.content)
             logger.info("event=image_downloaded platform=gpt count=%d", len(images))
-            completed = True
             return images[0] if len(images) == 1 else images
         finally:
-            # 仅在图片已完整取回后清理会话，超时时保留网页端结果供后续人工恢复。
-            if completed:
-                await self.delete_conversation_async(conversation_id)
+            # 会话保留供后续续用，仅释放本次输出的关联标识，不再自动隐藏。
+            self._image_request_message_id = ""

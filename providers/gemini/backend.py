@@ -1,9 +1,11 @@
 from __future__ import annotations
 from core.admission import mark_model_request_started
 from core.model_timeout import MODEL_TIMEOUT_SECONDS
+from core.slot_sessions import ConversationUnavailable
 
 import asyncio
 import contextlib
+import copy
 import io
 import json
 from typing import Any
@@ -14,6 +16,11 @@ from curl_cffi.requests import AsyncSession
 from utils.log import error_http_status, image_stage, logger, stable_log_ref
 from utils.image_binary import image_media_type
 from utils.oss_reference import read_oss_reference
+from utils.helper import is_transport_error
+from providers.gemini.webapi.exceptions import AuthError
+from providers.gemini.webapi.constants import GRPC
+from providers.gemini.webapi.types import RPCData
+from providers.gemini.webapi.utils import extract_json_from_response, get_nested_value
 
 
 def _required_model(client: Any, name: str) -> Any:
@@ -66,13 +73,38 @@ def _install_aspect_ratio_stream_hook(session: Any) -> None:
 
     original_stream = session.stream
 
-    def stream(method: str, url: Any, *args: Any, **kwargs: Any) -> Any:
+    @contextlib.asynccontextmanager
+    async def stream(method: str, url: Any, *args: Any, **kwargs: Any) -> Any:
         aspect_ratio = getattr(session, "_gemini_aspect_ratio", None)
         if aspect_ratio and str(url).endswith("/StreamGenerate"):
             data = kwargs.get("data")
             if isinstance(data, dict):
                 kwargs["data"] = _inject_aspect_ratio(data, aspect_ratio)
-        return original_stream(method, url, *args, **kwargs)
+        if str(url).endswith("/StreamGenerate"):
+            before_send = getattr(session, "_gemini_before_model_send", None)
+            if before_send is not None:
+                await before_send()
+            await mark_model_request_started()
+        # 让上游正常完成会话保存；不能在拿到图片时主动中止仍在收尾的传输。
+        original_error = None
+        try:
+            async with original_stream(method, url, *args, **kwargs) as response:
+                try:
+                    yield response
+                except BaseException as exc:
+                    original_error = exc
+                    # 只在失败/外部取消时停止仍有效的传输，不重复关闭整个客户端。
+                    if not isinstance(exc, GeneratorExit) and not getattr(session, "_closed", False):
+                        task = getattr(response, "astream_task", None)
+                        curl = getattr(response, "curl", None)
+                        if task is not None and not task.done() and curl is not None and curl._curl is not None:
+                            session.acurl.remove_handle(curl)
+                    raise
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling() or original_error is None:
+                raise
+            # 关闭失败连接引起的底层取消不能覆盖原始上游异常。
+            raise original_error
 
     # AsyncSession 允许实例属性覆盖；GeneratedImage 仍会收到真实 AsyncSession。
     session.stream = stream
@@ -169,14 +201,31 @@ async def _prepare_reference_images(sources: list[str]):
 class GeminiBackendAPI:
     """Gemini Web reverse client; no browser process and no persistent image files."""
 
-    def __init__(self, account: dict[str, Any]) -> None:
+    def __init__(self, account: dict[str, Any], before_model_send=None) -> None:
         self.account = account
         self.client = None
         self._request_generation = 0
+        self.before_model_send = before_model_send
+        self.model_request_started = False
+
+    async def _before_actual_send(self) -> None:
+        """实际StreamGenerate前串行领取账号发送许可，上传不占发送时间点。"""
+        if self.before_model_send is not None:
+            await self.before_model_send()
+        self.model_request_started = True
 
     async def __aenter__(self):
         from providers.gemini.account import gemini_account_service
-        self.client, self._request_generation = await gemini_account_service.get_request_client(self.account)
+        try:
+            self.client, self._request_generation = await gemini_account_service.get_request_client(self.account)
+        except Exception as exc:
+            # 客户端初始化尚未生图，明确认证失败统一交给调用侧换号。
+            if (not isinstance(exc, AuthError) and not is_transport_error(exc)
+                    and gemini_account_service.is_auth_error(exc)):
+                raise AuthError("Gemini account requires authentication") from exc
+            raise
+        _install_aspect_ratio_stream_hook(self.client.client)
+        self.client.client._gemini_before_model_send = self._before_actual_send
         return self
 
     async def __aexit__(self, exc_type, *_args):
@@ -197,13 +246,14 @@ class GeminiBackendAPI:
         )
         await gemini_account_service.discard_client(self.account["name"])
         self.client, self._request_generation = await gemini_account_service.get_request_client(self.account)
+        _install_aspect_ratio_stream_hook(self.client.client)
+        self.client.client._gemini_before_model_send = self._before_actual_send
 
     async def _do_chat(self, prompt: str, images: list[str] | None, model: str) -> str:
         image_sources = images or []
         # 所有 Gemini 分析固定为 3.8 Flash 高思考；传模型对象绕过客户端的模糊名称解析。
         client_model = _required_model(self.client, "gemini-3.8-flash")
         async with _prepare_reference_images(image_sources) as images:
-            await mark_model_request_started()
             stream = self.client.generate_content_stream(
                 prompt, files=images or None, model=client_model, extended_thinking=True
             )
@@ -239,7 +289,7 @@ class GeminiBackendAPI:
             return await self._do_chat(prompt, images, model)
         except Exception as exc:
             err_str = str(exc).lower()
-            if any(w in err_str for w in ("auth", "401", "unauthorized", "cookie", "expired", "stream suspended")):
+            if not self.model_request_started and any(w in err_str for w in ("auth", "401", "unauthorized", "cookie", "expired")):
                 await self._reconnect()
                 return await self._do_chat(prompt, images, model)
             raise
@@ -250,29 +300,57 @@ class GeminiBackendAPI:
         model: str,
         references: list[str] | None = None,
         aspect_ratio: str | None = None,
+        *, conversation_ref: dict | None = None, on_conversation=None,
     ) -> list[bytes]:
         # 初版、重刷及单张/整套调整均固定使用账号实际提供的 Pro 高思考。
         client_model = _required_model(self.client, "gemini-pro")
+        chat = None
+        if conversation_ref is not None:
+            # 只在正式生图前确认旧会话；明确不存在才允许调用侧在原账号新建。
+            response = await self.client._batch_execute([RPCData(
+                rpcid=GRPC.LIST_CONVERSATION_TURNS,
+                payload=json.dumps([conversation_ref["cid"], 1, None, 1, [1], [4], None, 1]),
+            )])
+            for part in extract_json_from_response(response.text):
+                if (get_nested_value(part, [1]) == GRPC.LIST_CONVERSATION_TURNS
+                        and get_nested_value(part, [5, 0]) == 5):
+                    raise ConversationUnavailable("Previous Gemini conversation is no longer accessible")
+        if conversation_ref is not None or on_conversation is not None:
+            chat = self.client.start_chat(model=client_model,
+                metadata=copy.deepcopy(conversation_ref["metadata"]) if conversation_ref else None)
         _configure_image_aspect_ratio(self.client, aspect_ratio)
         try:
             async with _prepare_reference_images(references or []) as images:
                 generated = []
                 with image_stage("gemini", "generate"):
-                    await mark_model_request_started()
                     stream = self.client.generate_content_stream(
-                        prompt, files=images or None, model=client_model, extended_thinking=True
+                        prompt, files=images or None, model=client_model, extended_thinking=True, chat=chat
                     )
+                    completed = False
                     try:
                         async for output in stream:
-                            generated = list(
+                            if chat is not None:
+                                # 收集状态但不提前发布绑定；取得图片不代表会话已完成保存。
+                                chat.metadata = output.metadata
+                                if output.candidates:
+                                    chat.rcid = output.rcid
+                            found = list(
                                 output.candidates[output.chosen].generated_images
                                 if output.candidates else []
                             )
-                            if generated:
-                                break
+                            # 最终文本帧可能不再带图片，保留本轮已取得的图片资源。
+                            if found:
+                                generated = found
+                        completed = True
+                    except Exception as exc:
+                        if not generated:
+                            raise
+                        # 已有本次图片资源则继续取图，不为保存会话重发或丢弃图片。
+                        logger.warning("event=gemini_session_unconfirmed reason_code=%s", type(exc).__name__)
                     finally:
-                        # 图片候选已到达即可返回，主动关闭流避免继续等待文本完成标记。
                         await stream.aclose()
+                    if completed and chat is not None and on_conversation is not None:
+                        await on_conversation({"cid": chat.cid, "metadata": copy.deepcopy(chat.metadata)})
                     if not generated:
                         raise RuntimeError("Gemini returned no image")
                 logger.info("event=image_assets_found platform=gemini count=%d", len(generated))
@@ -293,14 +371,17 @@ class GeminiBackendAPI:
         model: str,
         references: list[str] | None = None,
         aspect_ratio: str | None = None,
+        *, conversation_ref: dict | None = None, on_conversation=None,
     ) -> list[bytes]:
         try:
-            return await self._do_image(prompt, model, references, aspect_ratio)
+            return await self._do_image(prompt, model, references, aspect_ratio,
+                                        conversation_ref=conversation_ref, on_conversation=on_conversation)
         except Exception as exc:
             err_str = str(exc).lower()
-            if any(w in err_str for w in ("auth", "401", "unauthorized", "cookie", "expired", "stream suspended")):
+            if not self.model_request_started and any(w in err_str for w in ("auth", "401", "unauthorized", "cookie", "expired")):
                 await self._reconnect()
-                return await self._do_image(prompt, model, references, aspect_ratio)
+                return await self._do_image(prompt, model, references, aspect_ratio,
+                                            conversation_ref=conversation_ref, on_conversation=on_conversation)
             raise
 
 

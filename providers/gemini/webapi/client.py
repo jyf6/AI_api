@@ -1322,7 +1322,7 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 "last_thoughts": {},
             }
             output = None
-            async for output in self._generate(
+            async with contextlib.aclosing(self._generate(
                 prompt=prompt,
                 req_file_data=file_data,
                 model=model,
@@ -1333,8 +1333,10 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                 deep_research=deep_research,
                 extended_thinking=extended_thinking,
                 **kwargs,
-            ):
-                yield output
+            )) as generation_stream:
+                # 外层提前收图或取消时，立即关闭底层生成器及HTTP流。
+                async for output in generation_stream:
+                    yield output
 
             if output and isinstance(chat, ChatSession):
                 output.metadata = chat.metadata
@@ -1518,6 +1520,11 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                         )
                     if response.status_code != 200:
                         await self.close()
+                        # 正式提交明确被拒绝时交由调用侧等待/换号，不能按未知结果重放。
+                        if response.status_code == 429:
+                            raise TemporarilyBlockedError("Gemini generation rejected (HTTP 429)")
+                        if response.status_code == 401:
+                            raise AuthError("Gemini generation requires authentication (HTTP 401)")
                         raise APIError(
                             f"Failed to generate contents. Status: {response.status_code}"
                         )
@@ -1926,7 +1933,12 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                                             getattr(chat, "rcid", "") if chat else ""
                                         )
 
-                                        is_new_turn = rec_rcid != prev_rcid
+                                        # 必须命中本次流已确认的响应，不能仅凭历史最新rcid变化领图。
+                                        is_new_turn = bool(
+                                            current_expected_rcid
+                                            and current_expected_rcid != prev_rcid
+                                            and rec_rcid == current_expected_rcid
+                                        )
 
                                         if is_new_turn:
                                             logger.debug(

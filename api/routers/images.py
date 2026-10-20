@@ -10,6 +10,8 @@ from api.schemas import ImageGenerationRequest
 from core.router import resolve_model
 from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from core.admission import CapacityUnavailable
+from core.slot_sessions import CURRENT_SESSION, ConversationUnavailable, slot_sessions
+from core.account_pool import AccountUnavailable
 from api.model_execution import acquire_traced_account, execute_model_request
 from providers.doubao.account import doubao_account_service
 from providers.doubao.backend import DoubaoBackendAPI
@@ -18,6 +20,7 @@ from providers.gemini.backend import GeminiBackendAPI
 from providers.openai.account import account_service
 from providers.openai.backend import OpenAIBackendAPI
 from providers.openai.credentials import CredentialUnavailable
+from providers.gemini.webapi.exceptions import AuthError, ModelInvalidError, TemporarilyBlockedError, UsageLimitExceededError
 from utils.helper import ImageQuotaExceededError, UpstreamHTTPError, is_transport_error
 from utils.image_binary import image_media_type
 from utils.image_ratio import build_ratio_prompt
@@ -51,17 +54,89 @@ def _checked_image(images, platform: str) -> bytes:
     return image
 
 
+async def _acquire_image_account(service, platform: str, key_field: str, attempt: int):
+    """有槽位时优先指定账号，忙碌只等待，需人工恢复才切换。"""
+    session = CURRENT_SESSION.get()
+    while True:
+        preferred = session.account_id if session else None
+        try:
+            if session is None:
+                return await acquire_traced_account(service, "image", platform, key_field, attempt)
+            account = await acquire_traced_account(service, "image", platform, key_field, attempt,
+                account_id=preferred, excluded_account_ids=session.excluded_account_ids if session else None)
+            session.account_hint = account["account_id"]
+            return account
+        except AccountUnavailable:
+            if session is None:
+                raise
+            if preferred is not None:
+                session.excluded_account_ids.add(preferred)
+                await session.forget()
+        except CredentialUnavailable:
+            if session is not None and preferred is not None:
+                if not service.account_is_recoverable(preferred):
+                    session.excluded_account_ids.add(preferred)
+                    await session.forget()
+                    continue
+                # 自动刷新/凭证写库尚未完成，仍等待同账号，不把它当成人工失效。
+                raise CapacityUnavailable() from None
+            raise
+        except CapacityUnavailable as exc:
+            if session is not None and exc.code == "NO_HEALTHY_ACCOUNT":
+                raise HTTPException(status_code=502, detail="No automatically recoverable image account") from exc
+            raise
+
+
+def _session_options(account: dict) -> dict:
+    """会话参数只在Python内部传递，图片响应不增加任何来源信息。"""
+    session = CURRENT_SESSION.get()
+    if session is None:
+        return {}
+    return {"conversation_ref": session.conversation_ref,
+            "on_conversation": lambda reference: session.save(account["account_id"], reference)}
+
+
+async def _retry_session_rejection(exc: Exception, platform: str) -> bool:
+    """仅对确定未生成的账号/会话拒绝重选，不重放超时或下载失败。"""
+    session = CURRENT_SESSION.get()
+    if session is None:
+        return False
+    if isinstance(exc, (ImageQuotaExceededError, TemporarilyBlockedError, UsageLimitExceededError)) or (
+        isinstance(exc, UpstreamHTTPError) and exc.status_code == 429
+        and exc.context != "download_image_bytes" and "/download" not in exc.context
+    ):
+        # 明确拒绝且没有生成：保留原账号会话，下一次领取等待其冷却恢复。
+        return True
+    if isinstance(exc, ConversationUnavailable) or (
+        isinstance(exc, ModelInvalidError) and "conversation history" in str(exc).lower()
+    ):
+        account_id = session.account_id
+        await session.forget()
+        session.account_hint = account_id
+        return True
+    auth_rejected = (isinstance(exc, (AccountUnavailable, AuthError))
+                     or isinstance(exc, UpstreamHTTPError) and exc.status_code == 401
+                     and exc.context != "download_image_bytes" and "/download" not in exc.context)
+    if auth_rejected:
+        if session.account_id is not None:
+            session.excluded_account_ids.add(session.account_id)
+        await session.forget()
+        return True
+    return False
+
+
 async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: str, request_id: str, attempt: int):
     if resolved.platform == "gemini":
-        account = await acquire_traced_account(gemini_account_service, "image", "gemini", "name", attempt)
+        account = await _acquire_image_account(gemini_account_service, "gemini", "name", attempt)
         account_ref = stable_log_ref("gemini-account", account.get("name"))
         proxy_ref = proxy_log_ref(account)
         logger.info("event=upstream_attempt_started request_id=%s python_attempt=%d platform=gemini account_ref=%s proxy_ref=%s",
                     request_id, attempt, account_ref, proxy_ref)
         upstream_started = time.monotonic()
         try:
-            async with GeminiBackendAPI(account) as backend:
-                images = await backend.image(prompt, resolved.model, body.images, body.aspect_ratio)
+            async with GeminiBackendAPI(account, before_model_send=lambda: gemini_account_service.wait_for_model_send(account)) as backend:
+                images = await backend.image(prompt, resolved.model, body.images, body.aspect_ratio,
+                                              **_session_options(account))
             image = _checked_image(images, "gemini")
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gemini account_ref=%s proxy_ref=%s duration_ms=%d",
                         request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000))
@@ -76,7 +151,10 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
                            request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000),
                            getattr(exc, "reason_code", type(exc).__name__), error_http_status(exc), _failure_scope(exc), getattr(exc, "code", None))
             gemini_account_service.release_account(
-                account["name"], False, "" if isinstance(exc, ImageResultError) else str(exc), status_code=error_http_status(exc),
+                account["name"], False, "" if isinstance(exc, (ImageResultError, ConversationUnavailable)) else str(exc),
+                status_code=(401 if isinstance(exc, AuthError) else 429
+                             if isinstance(exc, (TemporarilyBlockedError, UsageLimitExceededError))
+                             else error_http_status(exc)),
                 task_type="image", failure_scope=_failure_scope(exc), acquired_account=account,
             )
             raise
@@ -119,7 +197,7 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
             )
             raise
     else:
-        account = await acquire_traced_account(account_service, "image", "gpt", "email", attempt)
+        account = await _acquire_image_account(account_service, "gpt", "email", attempt)
         account_ref = stable_log_ref("gpt-account", account.get("email"))
         proxy_ref = proxy_log_ref(account)
         logger.info("event=upstream_attempt_started request_id=%s python_attempt=%d platform=gpt account_ref=%s proxy_ref=%s",
@@ -127,8 +205,10 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
         upstream_started = time.monotonic()
         try:
             async with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", ""),
-                    credential_provider=lambda: account_service.prepare_request_account(account)) as backend:
-                images = await backend.generate_image_bytes(prompt, resolved.model, references=body.images, expected_count=1)
+                    credential_provider=lambda: account_service.prepare_request_account(account),
+                    before_model_send=lambda: account_service.wait_for_model_send(account)) as backend:
+                images = await backend.generate_image_bytes(prompt, resolved.model, references=body.images,
+                                                            expected_count=1, **_session_options(account))
             image = _checked_image(images, "gpt")
             account_service.release_account(account["email"], True, task_type="image", acquired_account=account)
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gpt account_ref=%s proxy_ref=%s duration_ms=%d",
@@ -165,7 +245,9 @@ async def _generate_images(body: ImageGenerationRequest):
     from utils.oss_reference import release_memory_references
     memory_keys = []
     try:
-        return await _generate_images_prepared(body, memory_keys)
+        platform = resolve_model(body.model, "image").platform
+        async with slot_sessions.claim(body.task_code, body.item_id, platform):
+            return await _generate_images_prepared(body, memory_keys)
     finally:
         release_memory_references(memory_keys)
 
@@ -258,7 +340,7 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if attempt == 0:
+            if attempt == 0 and (resolved.platform == "doubao" or await _retry_session_rejection(exc, resolved.platform)):
                 logger.warning(
                     "event=image_attempt_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=1 max_attempts=2 reason=%s",
                     request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
@@ -267,9 +349,9 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
                 await asyncio.sleep(1)
                 continue
             logger.error(
-                "event=image_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=2 max_attempts=2 elapsed_ms=%d reason=%s",
+                "event=image_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=%d max_attempts=2 elapsed_ms=%d reason=%s",
                 request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
-                body.stage, resolved.platform, int((time.monotonic() - started_at) * 1000), type(exc).__name__,
+                body.stage, resolved.platform, attempt + 1, int((time.monotonic() - started_at) * 1000), type(exc).__name__,
             )
             raise HTTPException(
                 status_code=502, detail=f"{resolved.platform} image generation failed: {exc}",

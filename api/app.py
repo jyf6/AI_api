@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 from api.routers import accounts, capacity, chat, edit, health, images, oauth, proxies
 from utils.log import logger
 from core.admission import initialize_model_admission
+from core.slot_sessions import slot_sessions
 
 CAPACITY_REDIS_PREFIX = "flexi:ai:capacity:"
 CAPACITY_SNAPSHOT_TTL_SECONDS = 4
@@ -45,6 +46,8 @@ def create_app() -> FastAPI:
         from providers.openai.account import account_service
         credential_task = asyncio.create_task(account_service.credentials.maintain())
         redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
+        # 当前会话只复用现有连接，不新增数据库字段或图片来源记录。
+        slot_sessions.redis = redis_client
         capacity_task = asyncio.create_task(publish_capacity_snapshots(redis_client))
         # 后台限并发预热，并持续恢复中断的续期客户端。
         warmup_task = asyncio.create_task(gemini_account_service.maintain_clients())
@@ -74,6 +77,7 @@ def create_app() -> FastAPI:
         except asyncio.CancelledError:
             pass
         await redis_client.aclose()
+        slot_sessions.redis = None
 
     app = FastAPI(title="ChatGPT-Image-Service", version="2.0.0", lifespan=lifespan)
 

@@ -137,7 +137,9 @@ def test_gemini_closes_stream_after_image_candidate(monkeypatch):
     monkeypatch.setattr(gemini_backend, "mark_model_request_started", mark_started)
     monkeypatch.setattr(gemini_backend, "_download_generated_image", download)
     backend = gemini_backend.GeminiBackendAPI({"proxy": ""})
-    backend.client = SimpleNamespace(client=None, generate_content_stream=lambda *_args, **_kwargs: stream)
+    backend.client = SimpleNamespace(client=None, generate_content_stream=lambda *_args, **_kwargs: stream,
+        list_models=lambda: [SimpleNamespace(model_name="gemini-pro", display_name="Pro", aliases=[],
+                                             model_id="pro", is_available=True)])
 
     result = asyncio.run(backend._do_image("prompt", "auto"))
 

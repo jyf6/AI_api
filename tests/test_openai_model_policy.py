@@ -59,6 +59,7 @@ def test_gpt_policy_reaches_actual_upstream_requests(monkeypatch, action):
                 monkeypatch.setattr(backend, "delete_conversation_async", AsyncMock())
                 result = await backend.generate_image_bytes("generate", model, references=["oss://reference"])
                 assert result == b"generated image"
+                backend.delete_conversation_async.assert_not_awaited()
             else:
                 model = "auto" if action == "health" else resolve_model("gpt-chat", "chat").model
                 assert model == ("auto" if action == "health" else "gpt-5-6-thinking")

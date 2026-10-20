@@ -16,11 +16,15 @@ async def _wait_disconnect(request: Request):
             return
 
 
-async def acquire_traced_account(service, task_type: str, platform: str, key_field: str, python_attempt: int):
+async def acquire_traced_account(service, task_type: str, platform: str, key_field: str, python_attempt: int,
+                                  *, account_id: int | None = None, excluded_account_ids: set[int] | None = None):
     """在实际选中账号处记录等待耗时和匿名账号、代理引用。"""
     started = time.monotonic()
     try:
-        account = await service.acquire_account(task_type)
+        account = (await service.acquire_account(task_type)
+                   if account_id is None and not excluded_account_ids
+                   else await service.acquire_account(task_type, account_id=account_id,
+                                                      excluded_account_ids=excluded_account_ids))
     except Exception as exc:
         reason = "NO_ACCOUNT" if isinstance(exc, CapacityUnavailable) else type(exc).__name__
         logger.warning("event=account_acquire_finished outcome=failed platform=%s task_type=%s python_attempt=%d duration_ms=%d reason_code=%s",

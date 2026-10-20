@@ -19,6 +19,8 @@ class OpenAIAccountPool(BaseAccountPool):
     """OpenAI account pool with OAuth token refresh and JWT-based metadata."""
 
     PROVIDER_NAME = "ChatGPT"
+    # 单账号分析和生图各四个在途，合计最多八个。
+    MAX_INFLIGHT_TOTAL = 8
 
     def __init__(self) -> None:
         super().__init__(platform="gpt")

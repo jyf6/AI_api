@@ -49,7 +49,9 @@ def test_all_platforms_share_timeout_and_cancel_expired_attempts(monkeypatch, pl
         with pytest.raises(router.HTTPException) as error:
             asyncio.run(call)
         assert error.value.status_code == 502
-        assert budgets == [240, 240]  # 保留既有重试次数，每次独立计时。
+        # GPT/Gemini 图片超时不能证明上游未生成，禁止自动重放。
+        expected = 1 if action == "image" and platform != "doubao" else 2
+        assert budgets == [240] * expected
     else:
         response = asyncio.run(call)
         assert response.status_code == 200
