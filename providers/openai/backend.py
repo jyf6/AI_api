@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional
 from curl_cffi import requests
 
-from utils.helper import ImageQuotaExceededError, ensure_ok, aiter_sse_payloads
+from utils.helper import ImageQuotaExceededError, ImageDownloadError, ensure_ok, aiter_sse_payloads
 from core.blocking import run_blocking
 from core.admission import mark_model_request_started
 from core.model_timeout import MODEL_TIMEOUT_SECONDS
@@ -39,11 +39,11 @@ _cache_timestamp: float = 0.0
 _CACHE_TTL: float = 1800.0  # 30 minutes
 
 
-def _model_parameters(model: str) -> dict[str, str]:
-    # 业务路由选择 Thinking 模型后统一使用扩展思考；账号探活仍使用 auto。
+def _model_parameters(model: str, thinking_level: str = "high") -> dict[str, str]:
+    # Python 只翻译 Java 给定的档位，不自行改变模型选择。
     parameters = {"model": model}
     if model.endswith("-thinking"):
-        parameters["thinking_effort"] = "extended"
+        parameters["thinking_effort"] = {"medium": "medium", "high": "extended"}[thinking_level]
     return parameters
 
 
@@ -59,9 +59,10 @@ class OpenAIBackendAPI:
     """ChatGPT reverse client with per-account proxy binding and zero-storage image output."""
 
     def __init__(self, access_token: str = "", proxy: str = "", device_id: str = "", credential_provider=None,
-                 before_model_send=None) -> None:
+                 before_model_send=None, after_model_send=None) -> None:
         self.credential_provider = credential_provider
         self.before_model_send = before_model_send
+        self.after_model_send = after_model_send
         self.access_token = access_token.strip()
         self.proxy = proxy.strip()
         self.base_url = "https://chatgpt.com"
@@ -134,7 +135,31 @@ class OpenAIBackendAPI:
                 if self.before_model_send is not None:
                     await self.before_model_send()
                 await mark_model_request_started()
-        return await getattr(self.session, method.lower())(url, **kwargs)
+
+        # 分段超时：建联15秒，读取出图240秒
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            kwargs["timeout"] = (15, MODEL_TIMEOUT_SECONDS)
+        elif isinstance(timeout, (int, float)):
+            kwargs["timeout"] = (15, float(timeout))
+
+        # 仅当明确属于 DNS、TCP 建联或代理握手失败时，才在原代理上等待 1 秒重试 1 次
+        # 请求提交后若进入读取超时（Read Timeout / Thinking Timeout），严禁重发 POST 避免上游重复扣费或重复生图
+        from utils.helper import is_connect_error
+        for attempt in range(2):
+            try:
+                response = await getattr(self.session, method.lower())(url, **kwargs)
+                if (method == "POST" and url in {
+                    self.base_url + "/backend-api/conversation", self.base_url + "/backend-api/f/conversation"
+                } and self.after_model_send is not None):
+                    await self.after_model_send()
+                return response
+            except Exception as exc:
+                if attempt == 0 and is_connect_error(exc):
+                    logger.warning("event=proxy_connect_retry method=%s url=%s reason=%s", method, url, type(exc).__name__)
+                    await asyncio.sleep(1)
+                    continue
+                raise
 
     async def _close_stream(self, response: requests.Response) -> None:
         # curl_cffi 0.16 的 aclose 只等待传输结束；主动移除未结束的句柄，
@@ -346,19 +371,26 @@ class OpenAIBackendAPI:
             converted.append(message)
         return converted
 
-    async def stream_chat(self, messages: list[dict[str, Any]], model: str = "auto") -> AsyncIterator[str]:
+    async def stream_chat(
+        self, messages: list[dict[str, Any]], model: str = "auto",
+        conversation_id: str | None = None, parent_message_id: str | None = None,
+        thinking_level: str = "medium",
+    ) -> AsyncIterator[str]:
         await self._bootstrap()
         reqs = await self._get_chat_requirements()
         path = "/backend-api/conversation"
-        payload = {"action": "next", "messages": await self._conversation_messages(messages), **_model_parameters(model), "parent_message_id": str(uuid.uuid4()),
+        payload = {"action": "next", "messages": await self._conversation_messages(messages), **_model_parameters(model, thinking_level),
+                   "parent_message_id": parent_message_id or str(uuid.uuid4()),
                    "conversation_mode": {"kind": "primary_assistant"}, "conversation_origin": None,
                    "force_paragen": False, "force_paragen_model_slug": "", "force_rate_limit": False,
-                   "force_use_sse": True, "history_and_training_disabled": True, "reset_rate_limits": False,
+                   "force_use_sse": True, "reset_rate_limits": False,
                    "suggestions": [], "supported_encodings": [], "system_hints": [], "timezone": "Asia/Shanghai",
                    "timezone_offset_min": -480, "variant_purpose": "comparison_implicit", "websocket_request_id": str(uuid.uuid4()),
                    "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 120,
                                                "page_height": 900, "page_width": 1400, "pixel_ratio": 2,
                                                "screen_height": 1440, "screen_width": 2560}}
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         response = await self._request("POST", self.base_url + path, headers=self._conversation_headers(path, reqs), json=payload, timeout=MODEL_TIMEOUT_SECONDS, stream=True)
         ensure_ok(response, path)
         try:
@@ -367,12 +399,20 @@ class OpenAIBackendAPI:
         finally:
             await self._close_stream(response)
 
-    async def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "auto") -> str:
+    async def chat_text_with_context(
+        self, prompt: str, images: list[str] | None = None, model: str = "auto",
+        conversation_id: str | None = None, parent_message_id: str | None = None,
+        thinking_level: str = "medium",
+    ) -> tuple[str, str | None, str | None]:
         text = ""
+        last_message_id = None
+        conv_id = conversation_id
         messages = [{"role": "user", "content": ([{"type": "text", "text": prompt}] +
                     [{"type": "image_url", "image_url": {"url": url}} for url in (images or [])])}]
         completed = False
-        async with aclosing(self.stream_chat(messages, model)) as stream:
+        async with aclosing(self.stream_chat(messages, model, conversation_id=conversation_id,
+                                             parent_message_id=parent_message_id,
+                                             thinking_level=thinking_level)) as stream:
             async for raw in stream:
                 if raw == "[DONE]":
                     completed = True
@@ -381,12 +421,16 @@ class OpenAIBackendAPI:
                     event = json.loads(raw)
                 except Exception:
                     continue
+                if isinstance(event, dict) and event.get("conversation_id"):
+                    conv_id = event["conversation_id"]
                 for candidate in (event, event.get("v") if isinstance(event, dict) else None):
                     if not isinstance(candidate, dict):
                         continue
                     message = candidate.get("message") or {}
                     if (message.get("author") or {}).get("role") != "assistant":
                         continue
+                    if message.get("id"):
+                        last_message_id = message["id"]
                     completed = completed or message.get("status") == "finished_successfully" or message.get("end_turn") is True
                     content = message.get("content") or {}
                     text = content.get("text") or "" if isinstance(content, dict) else ""
@@ -396,16 +440,22 @@ class OpenAIBackendAPI:
             raise RuntimeError("Upstream chat stream ended before completion")
         if not text.strip():
             raise RuntimeError("Upstream chat returned no assistant text")
+        return text.strip(), conv_id, last_message_id
+
+    async def chat_text(self, prompt: str, images: list[str] | None = None, model: str = "auto",
+                        thinking_level: str = "medium") -> str:
+        text, _, _ = await self.chat_text_with_context(prompt, images, model, thinking_level=thinking_level)
         return text
 
-    async def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "auto") -> str:
+    async def _prepare_image_conversation(self, prompt: str, reqs: ChatRequirements, model: str = "auto",
+                                         thinking_level: str = "high") -> str:
         """Prepare image conversation and obtain conduit_token."""
         path = "/backend-api/f/conversation/prepare"
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
             "parent_message_id": self._image_parent_message_id,
-            **_model_parameters(model),
+            **_model_parameters(model, thinking_level),
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -431,7 +481,9 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
 
-    async def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str, model: str = "auto", references: list[str] | None = None) -> tuple[requests.Response, set[bytes], set[str]]:
+    async def _start_image_generation(self, prompt: str, reqs: ChatRequirements, conduit_token: str,
+                                      model: str = "auto", references: list[str] | None = None,
+                                      thinking_level: str = "high") -> tuple[requests.Response, set[bytes], set[str]]:
         """Initiate image generation SSE long connection."""
         path = "/backend-api/f/conversation"
         parts: list[Any] = []
@@ -471,7 +523,7 @@ class OpenAIBackendAPI:
             "action": "next",
             "messages": [message],
             "parent_message_id": self._image_parent_message_id,
-            **_model_parameters(model),
+            **_model_parameters(model, thinking_level),
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
@@ -780,7 +832,7 @@ class OpenAIBackendAPI:
 
     async def generate_image_bytes(self, prompt: str, model: str = "auto", references: list[str] | None = None,
                                    expected_count: int = 1, *, conversation_ref: dict | None = None,
-                                   on_conversation=None) -> bytes | list[bytes]:
+                                   on_conversation=None, thinking_level: str = "high") -> bytes | list[bytes]:
         """Main entry: zero-storage in-memory image generation."""
         if not self.access_token:
             raise ValueError("access_token is required for image generation")
@@ -807,10 +859,12 @@ class OpenAIBackendAPI:
 
         # 3. Prepare conversation, get conduit_token
         with image_stage("gpt", "conversation_prepare"):
-            conduit_token = await self._prepare_image_conversation(prompt, reqs, model)
+            conduit_token = await self._prepare_image_conversation(prompt, reqs, model, thinking_level)
 
         # 4. Start image generation long connection
-        response, reference_hashes, reference_file_ids = await self._start_image_generation(prompt, reqs, conduit_token, model, references)
+        response, reference_hashes, reference_file_ids = await self._start_image_generation(
+            prompt, reqs, conduit_token, model, references, thinking_level
+        )
 
         conversation_id = ""
         sse_file_ids: list[str] = []
@@ -883,18 +937,27 @@ class OpenAIBackendAPI:
             images: list[bytes] = []
             with image_stage("gpt", "image_download"):
                 for source, asset_id in [("file", item) for item in file_ids] + [("attachment", item) for item in sediment_ids]:
-                    download_url = (
-                        await self._get_file_download_url(asset_id)
-                        if source == "file"
-                        else await self._get_attachment_download_url(conversation_id, asset_id)
-                    )
-                    if not download_url:
-                        raise RuntimeError(f"Could not resolve download url for {source} asset {asset_id}")
-                    img_resp = await self._request("GET", download_url, timeout=60)
-                    ensure_ok(img_resp, "download_image_bytes")
-                    if hashlib.sha256(img_resp.content).digest() in reference_hashes:
-                        raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
-                    images.append(img_resp.content)
+                    for download_attempt in range(2):
+                        try:
+                            download_url = (
+                                await self._get_file_download_url(asset_id)
+                                if source == "file"
+                                else await self._get_attachment_download_url(conversation_id, asset_id)
+                            )
+                            if not download_url:
+                                raise RuntimeError(f"Could not resolve download url for {source} asset {asset_id}")
+                            img_resp = await self._request("GET", download_url, timeout=60)
+                            ensure_ok(img_resp, "download_image_bytes")
+                            if hashlib.sha256(img_resp.content).digest() in reference_hashes:
+                                raise RuntimeError("Upstream returned an uploaded reference instead of a generated image")
+                            images.append(img_resp.content)
+                            break
+                        except Exception as exc:
+                            if download_attempt == 0:
+                                logger.warning("event=image_download_retry platform=gpt source=%s reason_code=%s http_status=%s",
+                                               source, type(exc).__name__, error_http_status(exc))
+                                continue
+                            raise ImageDownloadError(f"GPT 已生成图片，但下载结果失败：{type(exc).__name__}") from exc
             logger.info("event=image_downloaded platform=gpt count=%d", len(images))
             return images[0] if len(images) == 1 else images
         finally:

@@ -10,7 +10,6 @@ from curl_cffi.requests import Cookies
 from core.account_pool import BaseAccountPool, serialized_account_edit
 from core.database import database
 from core.blocking import run_blocking
-from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from providers.gemini.webapi import AuthError
 from utils.helper import parse_cookie_string
 from utils.log import logger, stable_log_ref
@@ -103,6 +102,8 @@ class GeminiAccountPool(BaseAccountPool):
         # 业务请求独占客户端，空闲时复用；常驻 _clients 只负责账号续期与模型发现。
         self._idle_request_clients: dict[str, list[Any]] = {}
         self._request_generations: dict[str, int] = {}
+        self._request_client_totals: dict[str, dict[int, int]] = {}
+        self._request_warmup_locks: dict[str, asyncio.Lock] = {}
         self._warmup_limit = 5
         self._pending_cookie_saves: set[str] = set()
         self._cookie_save_locks: dict[str, asyncio.Lock] = {}
@@ -159,6 +160,11 @@ class GeminiAccountPool(BaseAccountPool):
         return self._replace_cookie_fields(name, {
             "cookie": _auth_cookie_header(psid, psidts), "psid": psid, "psidts": psidts, "cookie_jar": []
         })
+
+    def account_snapshot(self, name: str) -> dict[str, Any]:
+        """读取账号凭证快照，供录入或修改后的连通性预检使用。"""
+        with self._condition:
+            return dict(self._accounts[name])
 
     async def merge_cookie(self, name: str, updates: dict[str, str], jar: Any = None,
                            expected_generation: int | None = None) -> None:
@@ -218,7 +224,7 @@ class GeminiAccountPool(BaseAccountPool):
         """仅认证失效才停止账号，临时上游错误继续保留在池中。"""
         text = str(error).lower()
         return type(error).__name__ == "AuthError" or any(
-            marker in text for marker in ("unauthenticated", "unauthorized", "cookie", "expired", "401", "未认证")
+            marker in text for marker in ("unauthenticated", "unauthorized", "http 401", "status=401", "未认证")
         )
 
     def mark_auth_failed(self, name: str, error: Exception | str, expected_account: dict | None = None) -> None:
@@ -279,7 +285,9 @@ class GeminiAccountPool(BaseAccountPool):
             if (self._clients.get(name) is not client
                     or self._accounts.get(name, {}).get("status") not in {"active", "cooldown"}
                     or any(self._accounts[name].get(field) != expected_account.get(field)
-                           for field in ("account_id", "credential_version"))):
+                           for field in ("account_id", "credential_version"))
+                    or (self._accounts[name].get("status") == "cooldown"
+                        and self._accounts[name].get("cooldown_until", 0) > time.time())):
                 return
             account = self._accounts[name]
             old_status = account.get("status")
@@ -335,19 +343,22 @@ class GeminiAccountPool(BaseAccountPool):
             if stored is not None:
                 client.cookies = stored
             try:
-                await client.init(
-                    timeout=MODEL_TIMEOUT_SECONDS,
-                    watchdog_timeout=MODEL_TIMEOUT_SECONDS,
+                await asyncio.wait_for(client.init(
+                    timeout=120,
+                    watchdog_timeout=120,
                     auto_refresh=True,
                     refresh_interval=_refresh_interval(),
                     impersonate="chrome145",
-                )
+                ), timeout=120)
                 if not client._check_account_status():
                     raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
                 with self._condition:
                     current = self._accounts.get(name)
-                    if (current is None or current.get("status") != "active"
-                            or self._request_generations.get(name, 0) != generation):
+                    if current is None:
+                        raise RuntimeError("Gemini 账号已不存在")
+                    if current.get("status") != "active":
+                        raise RuntimeError("Gemini 账号状态已变更，初始化作废")
+                    if self._request_generations.get(name, 0) != generation:
                         raise RuntimeError("Gemini 账号在初始化期间已变更")
                     current["status"] = "active"
                     current["cooldown_until"] = 0
@@ -382,7 +393,10 @@ class GeminiAccountPool(BaseAccountPool):
             active_accounts = [
                 dict(acc) for acc in self._accounts.values()
                 if acc.get("status") == "active" and acc.get("cookie")
-                and not self._client_ready(self._clients.get(acc["name"]))
+                and (not self._client_ready(self._clients.get(acc["name"]))
+                     or self._request_client_totals.get(acc["name"], {}).get(
+                         self._request_generations.get(acc["name"], 0), 0
+                     ) < self.MAX_INFLIGHT_TOTAL)
             ]
 
         if not active_accounts:
@@ -398,7 +412,7 @@ class GeminiAccountPool(BaseAccountPool):
                     if current is None or current.get("status") != "active":
                         return
                 try:
-                    await self.get_client(acc)
+                    await self.prepare_account(acc["name"])
                 except Exception as exc:
                     if self.is_auth_error(exc):
                         self.mark_auth_failed(acc["name"], exc, acc)
@@ -406,6 +420,15 @@ class GeminiAccountPool(BaseAccountPool):
                                    stable_log_ref("gemini-account", acc["name"]), type(exc).__name__)
 
         await asyncio.gather(*(warm_one(acc) for acc in active_accounts))
+
+    async def prepare_account(self, name: str) -> None:
+        """在两分钟总预算内完成常驻登录检查与请求连接池预热。"""
+        async def initialize() -> None:
+            account = self.account_snapshot(name)
+            await self.get_client(account)
+            await self.warm_request_clients(name)
+
+        await asyncio.wait_for(initialize(), timeout=120)
 
     async def maintain_clients(self) -> None:
         """Retry failed initializations and recreate stopped refresh tasks."""
@@ -429,27 +452,96 @@ class GeminiAccountPool(BaseAccountPool):
                 client.cookies = dict(master.cookies)
                 return client, generation
             await client.close()
+            with self._condition:
+                totals = self._request_client_totals.get(name, {})
+                totals[generation] = max(0, totals.get(generation, 0) - 1)
 
+        # 预热池为空（例如刚换代理/换 Cookie，预热还在进行或被代次校验作废）时，
+        # 不再直接失败，而是现场补建一个请求客户端，避免测试与业务请求被池状态拖垮。
         from providers.gemini.webapi import GeminiClient
 
-        cookies = dict(master.cookies)
         with self._condition:
-            current = dict(self._accounts[name])
-        client = GeminiClient(
-            current["psid"], current["psidts"],
-            proxy=current.get("proxy") or None,
-        )
+            current = self._accounts.get(name)
+            if current is None:
+                raise RuntimeError("Gemini 账号不存在，无法补建请求客户端")
+            account_now = dict(current)
+            generation = self._request_generations.get(name, 0)
+
+        client = GeminiClient(account_now["psid"], account_now["psidts"],
+                              proxy=account_now.get("proxy") or None)
+        cookies = dict(master.cookies)
         if cookies:
             client.cookies = cookies
         try:
-            await client.init(timeout=MODEL_TIMEOUT_SECONDS, watchdog_timeout=MODEL_TIMEOUT_SECONDS,
-                              auto_refresh=False, impersonate="chrome145")
+            await asyncio.wait_for(client.init(timeout=120, watchdog_timeout=120,
+                                               auto_refresh=False, impersonate="chrome145"), timeout=120)
             if not client._check_account_status():
                 raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
-            return client, generation
         except BaseException:
             await client.close()
             raise
+
+        stale = False
+        with self._condition:
+            latest = self._accounts.get(name)
+            if (latest is None or latest.get("status") != "active"
+                    or self._request_generations.get(name, 0) != generation
+                    or latest.get("credential_version") != account_now.get("credential_version")
+                    or latest.get("proxy", "") != account_now.get("proxy", "")):
+                stale = True
+            else:
+                self._request_client_totals.setdefault(name, {})[generation] = (
+                    self._request_client_totals.setdefault(name, {}).get(generation, 0) + 1
+                )
+        if stale:
+            await client.close()
+            raise RuntimeError("Gemini 账号在请求客户端补建期间已变更，请重试")
+        return client, generation
+
+    async def warm_request_clients(self, name: str) -> None:
+        """账号录入、凭证更新和后台维护时预建 8 个独立请求客户端，生图请求不再承担初始化等待。"""
+        lock = self._request_warmup_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            account = self.account_snapshot(name)
+            master = await self.get_client(account)
+            with self._condition:
+                generation = self._request_generations.get(name, 0)
+                totals = self._request_client_totals.setdefault(name, {})
+                current_count = totals.get(generation, 0)
+            missing = max(0, self.MAX_INFLIGHT_TOTAL - current_count)
+            if not missing:
+                return
+            cookies = dict(master.cookies)
+
+            async def create_request_client() -> None:
+                from providers.gemini.webapi import GeminiClient
+
+                client = GeminiClient(account["psid"], account["psidts"], proxy=account.get("proxy") or None)
+                if cookies:
+                    client.cookies = dict(cookies)
+                try:
+                    await asyncio.wait_for(client.init(timeout=120, watchdog_timeout=120,
+                                                       auto_refresh=False, impersonate="chrome145"), timeout=120)
+                    if not client._check_account_status():
+                        raise RuntimeError("Gemini Cookie 未认证，请更新完整 Cookie Header")
+                    with self._condition:
+                        current = self._accounts.get(name)
+                        if (current is None or current.get("status") != "active"
+                                or self._request_generations.get(name, 0) != generation
+                                or current.get("credential_version") != account.get("credential_version")
+                                or current.get("proxy", "") != account.get("proxy", "")):
+                            raise RuntimeError("Gemini 账号在连接预热期间已变更")
+                        self._request_client_totals.setdefault(name, {})[generation] = (
+                            self._request_client_totals.setdefault(name, {}).get(generation, 0) + 1
+                        )
+                        self._idle_request_clients.setdefault(name, []).append(client)
+                except BaseException:
+                    await client.close()
+                    raise
+
+            await asyncio.wait_for(
+                asyncio.gather(*(create_request_client() for _ in range(missing))), timeout=120
+            )
 
     async def release_request_client(self, name: str, client: Any, generation: int, success: bool) -> None:
         """只回收本次请求的连接；人工更新账号后旧连接不会重新入池。"""
@@ -457,9 +549,12 @@ class GeminiAccountPool(BaseAccountPool):
             self._idle_request_clients.setdefault(name, []).append(client)
         else:
             await client.close()
+            with self._condition:
+                totals = self._request_client_totals.get(name, {})
+                totals[generation] = max(0, totals.get(generation, 0) - 1)
 
     async def close_clients(self) -> None:
-        for name in set(self._clients) | set(self._idle_request_clients):
+        for name in set(self._clients) | set(self._idle_request_clients) | set(self._request_client_totals):
             await self.discard_client(name)
 
     def _account_ready(self, account: dict[str, Any]) -> bool:
@@ -474,7 +569,10 @@ class GeminiAccountPool(BaseAccountPool):
             )):
                 return
             self._request_generations[name] = self._request_generations.get(name, 0) + 1
+            old_generation = self._request_generations[name] - 1
             idle = self._idle_request_clients.pop(name, [])
+            totals = self._request_client_totals.setdefault(name, {})
+            totals[old_generation] = max(0, totals.get(old_generation, 0) - len(idle))
             client = self._clients.pop(name, None)
             self._condition.notify_all()
         for request_client in idle:

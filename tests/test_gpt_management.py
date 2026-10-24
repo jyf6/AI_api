@@ -90,6 +90,7 @@ def test_unready_credentials_are_not_reported_as_busy_accounts(monkeypatch):
         owner = OpenAIAccountPool.__new__(OpenAIAccountPool)
         owner.__dict__.update(pool().__dict__)
         owner._batches = {}
+        owner._platform = ""
         owner.credentials = GPTCredentials(owner)
         owner._accounts["one"].update(access_token_expires_at=time.time() - 1)
         with pytest.raises(CredentialUnavailable):

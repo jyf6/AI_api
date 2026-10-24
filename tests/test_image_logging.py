@@ -32,7 +32,7 @@ def test_invalid_image_does_not_mark_account_success(monkeypatch, platform, resu
         async def __aexit__(self, *_args):
             return None
 
-        async def image(self, *_args):
+        async def image(self, *_args, **_kwargs):
             return result if isinstance(result, list) else [result]
 
         async def generate_image_bytes(self, *_args, **_kwargs):
@@ -51,7 +51,7 @@ def test_invalid_image_does_not_mark_account_success(monkeypatch, platform, resu
     service = {"gpt": images.account_service, "doubao": images.doubao_account_service,
                "gemini": images.gemini_account_service}[platform]
     monkeypatch.setattr(service, "release_account", released)
-    body = SimpleNamespace(images=[], aspect_ratio="1:1")
+    body = SimpleNamespace(images=[], aspect_ratio="1:1", thinking_level="high")
     resolved = SimpleNamespace(platform=platform, model="auto")
 
     with pytest.raises(images.ImageResultError) as error:

@@ -30,6 +30,8 @@ class SlotSession:
     data: dict[str, Any] | None = None
     account_hint: int | None = None
     excluded_account_ids: set[int] = field(default_factory=set)
+    initial_existed: bool = False
+    abandoned: bool = False
 
     @property
     def account_id(self) -> int | None:
@@ -46,10 +48,18 @@ class SlotSession:
             return
         if self.data == value:
             return
+        if self.abandoned:
+            return
         self.data = value
         self.account_hint = None
         if self.owner.redis is not None:
             try:
+                # 若换号接口已清除键，防止旧请求在途写回复活旧会话
+                if self.initial_existed and hasattr(self.owner.redis, "exists"):
+                    exists = await asyncio.wait_for(self.owner.redis.exists(self.key), 1)
+                    if not exists:
+                        logger.info("event=slot_session_writeback_skipped_due_to_switch key=%s", self.key)
+                        return
                 await asyncio.wait_for(self.owner.redis.set(
                     self.key, json.dumps(value, ensure_ascii=False), ex=SESSION_TTL_SECONDS), 1)
             except Exception as exc:
@@ -59,6 +69,7 @@ class SlotSession:
         """确定旧账号/会话失效后移除首选，不删除上游历史会话。"""
         self.data = None
         self.account_hint = None
+        self.initial_existed = False
         if self.owner.redis is not None:
             try:
                 await asyncio.wait_for(self.owner.redis.delete(self.key), 1)
@@ -106,9 +117,11 @@ class SlotSessions:
             if self.redis is not None:
                 try:
                     raw = await asyncio.wait_for(self.redis.getex(key, ex=SESSION_TTL_SECONDS), 1)
-                    value = json.loads(raw) if raw else None
-                    if self.valid(value, platform):
-                        session.data = value
+                    if raw:
+                        session.initial_existed = True
+                        value = json.loads(raw)
+                        if self.valid(value, platform):
+                            session.data = value
                 except Exception as exc:
                     logger.warning("event=slot_session_cache_read_failed platform=%s reason_code=%s", platform, type(exc).__name__)
             yield session

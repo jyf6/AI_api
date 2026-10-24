@@ -15,7 +15,7 @@ from tests.test_account_pool_scheduling import make_pool
 
 
 @pytest.mark.parametrize("platform", ["gpt", "gemini"])
-def test_route_reuses_and_replaces_only_current_account_session(monkeypatch, platform):
+def test_route_reuses_session_and_returns_bound_account_failure_for_confirmation(monkeypatch, platform):
     async def scenario():
         cache = SlotSessions()
         cache.redis = RedisMemory()
@@ -58,34 +58,34 @@ def test_route_reuses_and_replaces_only_current_account_session(monkeypatch, pla
             assert response.body == b"\x89PNG\r\n\x1a\nimage"
             assert not any("conversation" in key or "account" in key for key in response.headers)
         unavailable.add(1)
-        for _ in range(2):
+        with pytest.raises(images.HTTPException) as error:
             await images._generate_images(body)
-        assert [aid for aid, _ in calls] == [1, 1, 2, 2]
-        assert calls[0][1] is None and calls[2][1] is None
-        assert calls[1][1] is not None and calls[3][1] is not None
+        assert error.value.status_code == 401
+        assert '"code": "ACCOUNT_AUTH_INVALID"' in error.value.detail
+        assert [aid for aid, _ in calls] == [1, 1]
+        assert calls[0][1] is None and calls[1][1] is not None
         assert len(cache.redis.values) == 1
     asyncio.run(scenario())
 
 
-def test_only_definite_session_rejections_reset_preference():
+def test_account_and_session_rejections_leave_binding_for_user_decision():
     async def scenario():
         cache = SlotSessions()
         async with cache.claim("task", 1, "gpt") as session:
             await session.save(1, {"conversationId": "old"})
             assert not await images._retry_session_rejection(TimeoutError(), "gpt")
             assert session.account_id == 1
-            assert await images._retry_session_rejection(images.UpstreamHTTPError("/backend-api/f/conversation", 429, "limit"), "gpt")
+            assert not await images._retry_session_rejection(images.UpstreamHTTPError("/backend-api/f/conversation", 429, "limit"), "gpt")
             assert session.conversation_ref == {"conversationId": "old"}
             assert not await images._retry_session_rejection(images.UpstreamHTTPError("download_image_bytes", 429, "limit"), "gpt")
-            assert await images._retry_session_rejection(images.ConversationUnavailable(), "gpt")
-            assert session.account_id == 1 and session.conversation_ref is None
-            await session.save(1, {"conversationId": "new"})
-            assert await images._retry_session_rejection(AccountUnavailable(), "gpt")
-            assert session.account_id is None and 1 in session.excluded_account_ids
+            assert not await images._retry_session_rejection(images.ConversationUnavailable(), "gpt")
+            assert session.account_id == 1 and session.conversation_ref == {"conversationId": "old"}
+            assert not await images._retry_session_rejection(AccountUnavailable(), "gpt")
+            assert session.account_id == 1 and session.conversation_ref == {"conversationId": "old"}
     asyncio.run(scenario())
 
 
-def test_first_account_manual_refresh_failure_switches_before_model_send(monkeypatch):
+def test_bound_account_manual_refresh_failure_waits_for_user_switch(monkeypatch):
     async def scenario():
         pool = make_pool()
         async def prepare(account):
@@ -99,8 +99,10 @@ def test_first_account_manual_refresh_failure_switches_before_model_send(monkeyp
         monkeypatch.setattr(images, "acquire_traced_account", acquire)
         cache = SlotSessions()
         async with cache.claim("task", 1, "gpt") as session:
-            account = await images._acquire_image_account(pool, "gpt", "name", 1)
-            assert account["account_id"] == session.account_id == 2
-            assert session.conversation_ref is None
+            await session.save(1, {"conversationId": "old"})
+            with pytest.raises(AccountUnavailable):
+                await images._acquire_image_account(pool, "gpt", "name", 1)
+            assert session.account_id == 1
+            assert session.conversation_ref == {"conversationId": "old"}
             assert pool._accounts["a"]["inflight"] == 0
     asyncio.run(scenario())

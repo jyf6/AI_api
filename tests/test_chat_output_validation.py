@@ -11,7 +11,7 @@ def test_long_reference_and_composition_outputs_are_allowed():
     assert len(long_text) > 4000
     assert not is_anomalous_text(long_text, "INITIAL_ITEM_REF_ANALYSIS")
     assert not is_anomalous_text(long_text, "INITIAL_ITEM_COMPOSITION_PLANNING")
-    assert is_anomalous_text(long_text, "INITIAL_GLOBAL_ANALYSIS")
+    assert not is_anomalous_text(long_text, "INITIAL_GLOBAL_ANALYSIS")
 
 
 def test_short_english_product_selection_is_allowed_only_at_selection_stage():

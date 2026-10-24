@@ -38,7 +38,7 @@ def test_all_platforms_share_timeout_and_cancel_expired_attempts(monkeypatch, pl
 
     monkeypatch.setattr(router.asyncio, "wait_for", measured_wait_for)
     monkeypatch.setattr(router, "resolve_model", lambda *_: SimpleNamespace(platform=platform, model="auto"))
-    monkeypatch.setattr(router, "_execute_chat_once" if action == "chat" else "_generate_images_once", upstream)
+    monkeypatch.setattr(router, "_execute_chat_with_in_session_retry" if action == "chat" else "_generate_images_once", upstream)
     if action == "chat":
         body = ChatCompletionRequest(model=f"{platform}-chat", prompt="test")
         call = chat._chat_completions_prepared(body)
@@ -48,14 +48,16 @@ def test_all_platforms_share_timeout_and_cancel_expired_attempts(monkeypatch, pl
     if block:
         with pytest.raises(router.HTTPException) as error:
             asyncio.run(call)
-        assert error.value.status_code == 502
-        # GPT/Gemini 图片超时不能证明上游未生成，禁止自动重放。
-        expected = 1 if action == "image" and platform != "doubao" else 2
-        assert budgets == [240] * expected
+        assert error.value.status_code == 504
+        expected_code = "MODEL_READ_TIMEOUT" if action == "chat" else "IMAGE_READ_TIMEOUT"
+        assert f'"code": "{expected_code}"' in str(error.value.detail)
+        # 任一模型已提交的生成超时都不能证明上游未出图，禁止自动重放。
+        expected = 1
+        assert budgets == [480 if action == "chat" else 240] * expected
     else:
         response = asyncio.run(call)
         assert response.status_code == 200
         if action == "chat":
             assert json.loads(response.body)["text"] == '{"analysis":"done"}'
-        assert budgets == [240]
+        assert budgets == [480 if action == "chat" else 240]
     assert len(ended) == len(budgets)

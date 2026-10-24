@@ -189,8 +189,14 @@ class OpenAIAccountPool(BaseAccountPool):
             "unauthorized", "deactivated", "account disabled",
         )):
             return "fatal"
+        # 真额度耗尽、图片生成上限或上传文件保护：统一按文案识别，与 Gemini 同策略。
+        from utils.helper import detect_quota_exhausted
+        is_quota, _ = detect_quota_exhausted(error)
+        if is_quota:
+            return "quota_exhausted"
+        # 普通频控限流
         if status_code == 429 or any(kw in lower for kw in (
-            "quota", "rate limit", "too many", "429", "image_quota_exhausted", "图像生成请求上限", "图片生成请求上限",
+            "rate limit", "too many", "429", "throttled", "temporarily blocked",
         )):
             return "rate_limit"
         return "transient"

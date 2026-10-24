@@ -63,14 +63,14 @@ def test_collage_rejects_missing_image_and_caps_output():
         assert result.width / result.height == pytest.approx(1.5)
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_request_releases_memory_references(monkeypatch, fail):
+def test_request_passes_original_references_without_collage(monkeypatch, fail):
     from api.routers import images
     from api.schemas import ImageGenerationRequest
     from fastapi import HTTPException
     valid = image_bytes()
     monkeypatch.setattr(oss_reference, "read_oss_reference", lambda *_args: valid)
     async def generate(body, *_args):
-        assert body.images[0].startswith("memory://")
+        assert body.images == ["images/a.jpg"]
         if fail:
             raise HTTPException(status_code=502, detail="test")
         return valid

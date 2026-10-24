@@ -71,6 +71,7 @@ def image_stage(platform: str, stage: str):
     try:
         yield
     except BaseException as exc:
+        setattr(exc, "image_stage", stage)
         logger.warning(
             "event=image_stage_finished platform=%s stage=%s outcome=%s duration_ms=%d reason_code=%s http_status=%s transport_code=%s",
             platform, stage, "cancelled" if type(exc).__name__ == "CancelledError" else "failed",

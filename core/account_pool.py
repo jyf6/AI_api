@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
@@ -21,6 +22,18 @@ class AccountWaitCancelled(Exception):
 
 class AccountUnavailable(RuntimeError):
     """指定账号需要人工恢复或已移除，调用侧应更换账号。"""
+
+
+class BoundAccountCooldownError(RuntimeError):
+    """绑定账号处于冷却中，直接向上层抛出剩余时间。"""
+    def __init__(self, account_id: int, remaining_seconds: int, error_message: str = "",
+                 cooldown_until: float | None = None):
+        self.account_id = account_id
+        self.remaining_seconds = remaining_seconds
+        self.error_message = error_message
+        # 保留账号池的真实到期点，刷新页面不能从历史相对秒数重新倒计时。
+        self.cooldown_until = cooldown_until if cooldown_until is not None else time.time() + remaining_seconds
+        super().__init__(f"Bound account {account_id} is in cooldown for {remaining_seconds}s")
 
 
 T = TypeVar("T")
@@ -61,8 +74,8 @@ class BaseAccountPool:
     MAX_INFLIGHT_IMAGE: int = 4
     MAX_INFLIGHT_CHAT: int = 4
     MAX_INFLIGHT_TOTAL: int = 4
-    MIN_DISPATCH_INTERVAL_SECONDS: float = 1.0
-    RATE_LIMIT_COOLDOWN_SECONDS: int = 300
+    MIN_DISPATCH_INTERVAL_SECONDS: float = 2.5
+    RATE_LIMIT_COOLDOWN_SECONDS: int = 120
     PROVIDER_NAME: str = "base"
 
 
@@ -301,6 +314,10 @@ class BaseAccountPool:
                 return
             old_status = account.get("status")
             if healthy:
+                # 健康探测不能提前解除限流、额度或网络冷却；仅冷却到期流程恢复派单。
+                if account.get("status") == "cooldown" and account.get("cooldown_until", 0) > time.time():
+                    self._condition.notify_all()
+                    return
                 account["status"] = "active"
                 account["cooldown_until"] = 0
                 account["failure_count"] = 0
@@ -321,10 +338,13 @@ class BaseAccountPool:
 
     def list_accounts(self) -> list[dict[str, Any]]:
         with self._condition:
-            self._restore_expired_cooldowns(time.time())
+            now = time.time()
+            self._restore_expired_cooldowns(now)
             result = []
             for acc in self._accounts.values():
                 safe = dict(acc)
+                cd = int(safe.get("cooldown_until", 0) or 0)
+                safe["cooldown_remaining_seconds"] = max(0, cd - int(now)) if cd > 0 else 0
                 for secret_identity in ("device_id", "web_id", "fp"):
                     safe.pop(secret_identity, None)
                 if safe.get("proxy"):
@@ -339,12 +359,15 @@ class BaseAccountPool:
             return result
 
     def _restore_expired_cooldowns(self, now: float) -> None:
-        """恢复已到期的持久冷却账号，调用方需持有账号池锁。"""
+        """恢复已到期的冷却账号，仅依据系统时钟到期被动自动翻转，严禁发起网络探活。"""
         restored_keys = []
         for key, account in self._accounts.items():
-            if account.get("status") == "cooldown" and int(account.get("cooldown_until", 0) or 0) <= now:
+            cd_until = float(account.get("cooldown_until", 0) or 0)
+            if cd_until > 0 and cd_until <= now:
                 account["status"] = "active"
                 account["cooldown_until"] = 0
+                account["failure_count"] = 0
+                account["error_message"] = ""
                 restored_keys.append(key)
         if restored_keys:
             for key in restored_keys:
@@ -441,9 +464,19 @@ class BaseAccountPool:
         if permit is not None:
             await permit.begin_account_wait()
         try:
+            await self._refresh_model_call_counts()
             while True:
                 if account_id is not None and not self.account_is_recoverable(account_id):
                     raise AccountUnavailable("Bound account requires manual recovery")
+                if account_id is not None:
+                    with self._condition:
+                        bound = next((a for a in self._accounts.values() if a.get("account_id") == account_id), None)
+                        if bound is not None:
+                            cd_until = float(bound.get("cooldown_until", 0) or 0)
+                            rem = cd_until - time.time()
+                            if rem > 0:
+                                raise BoundAccountCooldownError(account_id, max(1, math.ceil(rem)), bound.get("error_message", ""),
+                                                                cooldown_until=cd_until)
                 if loop.time() >= deadline:
                     with self._condition:
                         failure = self._account_wait_failure()
@@ -507,6 +540,11 @@ class BaseAccountPool:
                     current = next((candidate for candidate in self._accounts.values()
                                     if candidate.get("account_id") == account.get("account_id")), account)
                     cooldown = current.get("cooldown_until", 0) - time.time()
+                    if cooldown > 0:
+                        raise BoundAccountCooldownError(
+                            current["account_id"], max(1, math.ceil(cooldown)),
+                            current.get("error_message", ""), cooldown_until=current["cooldown_until"],
+                        )
                 remaining = max(cooldown, times.get(key, 0) + self.MIN_DISPATCH_INTERVAL_SECONDS - loop.time())
                 if remaining <= 0:
                     break
@@ -514,7 +552,47 @@ class BaseAccountPool:
                 if budget <= 0:
                     raise CapacityUnavailable()
                 await asyncio.sleep(min(remaining, budget, .25))
+            # 连接建联可能失败且不应计入调用量；计数在上游接受模型 POST 后独立写入。
             times[key] = loop.time()
+
+    async def record_model_call(self, account: dict[str, Any]) -> None:
+        """只在模型 POST 已建立响应后计数；读取、上传、下载与失败建联不计。"""
+        key = account.get("account_id") or account.get("name") or account["email"]
+        window = int(time.time() // 600)
+        from core.slot_sessions import slot_sessions
+        try:
+            if self._platform in {"gpt", "gemini"} and slot_sessions.redis is not None:
+                redis_key = f"flexi:ai:account-model-calls:{self._platform}:{window}"
+                total = await slot_sessions.redis.hincrby(redis_key, str(key), 1)
+                await slot_sessions.redis.expire(redis_key, 1200)
+                with self._lock:
+                    self.__dict__.setdefault("_model_call_counts", {})[key] = int(total)
+            else:
+                with self._lock:
+                    counts = self.__dict__.setdefault("_model_call_counts", {})
+                    counts[key] = counts.get(key, 0) + 1
+        except Exception as exc:
+            logger.warning("event=account_call_count_write_failed platform=%s reason_code=%s",
+                           self._platform, type(exc).__name__)
+
+    async def _refresh_model_call_counts(self) -> None:
+        """每十分钟滚动计数由 Redis 保存；读取失败时继续使用进程内计数。"""
+        from core.slot_sessions import slot_sessions
+        if self._platform not in {"gpt", "gemini"} or slot_sessions.redis is None:
+            return
+        try:
+            window = int(time.time() // 600)
+            stored = await asyncio.wait_for(slot_sessions.redis.hgetall(
+                f"flexi:ai:account-model-calls:{self._platform}:{window}"), 1)
+            with self._lock:
+                counts = self.__dict__.setdefault("_model_call_counts", {})
+                counts.clear()
+                for key, value in stored.items():
+                    account_id = int(key)
+                    counts[account_id] = int(value)
+        except Exception as exc:
+            logger.warning("event=account_call_count_read_failed platform=%s reason_code=%s",
+                           self._platform, type(exc).__name__)
 
     def _account_wait_failure(self) -> Exception:
         """普通账号忙返回容量错误；平台可区分自己的凭证准备失败。"""
@@ -581,18 +659,49 @@ class BaseAccountPool:
                     logger.error("event=account_marked_error platform=%s account_ref=%s old_status=%s new_status=error status_code=%s reason_code=AUTH_OR_ACCOUNT_INVALID",
                                  self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0], status_code)
                 elif category == "rate_limit":
-                    account["status"] = "active"
-                    account["cooldown_until"] = int(time.time()) + (retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS)
+                    # 频控限流：强制冷却 2 分钟 (120 秒)，绝不记录代理失败
+                    cooldown_secs = 120
+                    account["status"] = "cooldown"
+                    account["cooldown_until"] = int(time.time()) + cooldown_secs
                     account["error_message"] = error[:500]
                     account["failure_count"] = account.get("failure_count", 0) + 1
                     batch["explicit"] = True
                     self._save_health(key)
-                    logger.warning("event=account_rate_limited platform=%s account_ref=%s old_status=%s new_status=active status_code=%s cooldown_seconds=%d cooldown_until=%d reason_code=RATE_LIMIT",
+                    logger.warning("event=account_rate_limited platform=%s account_ref=%s old_status=%s new_status=cooldown status_code=%s cooldown_seconds=%d cooldown_until=%d reason_code=RATE_LIMIT",
                                    self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0], status_code,
-                                   retry_after if retry_after and retry_after > 0 else self.RATE_LIMIT_COOLDOWN_SECONDS,
-                                   account["cooldown_until"])
+                                   cooldown_secs, account["cooldown_until"])
+                elif category == "quota_exhausted":
+                    # 额度耗尽 / 文件保护：优先用解析到的重置时间，缺省 5 小时 (18000 秒)，绝不记录代理失败
+                    from utils.helper import QUOTA_RESET_DEFAULT_SECONDS, detect_quota_exhausted
+                    _, detected_seconds = detect_quota_exhausted(error)
+                    cooldown_secs = (
+                        retry_after if retry_after and retry_after > 0
+                        else detected_seconds if detected_seconds and detected_seconds > 0
+                        else QUOTA_RESET_DEFAULT_SECONDS
+                    )
+                    account["status"] = "cooldown"
+                    account["cooldown_until"] = int(time.time()) + cooldown_secs
+                    account["error_message"] = error[:500]
+                    account["failure_count"] = account.get("failure_count", 0) + 1
+                    batch["explicit"] = True
+                    self._save_health(key)
+                    logger.warning("event=account_quota_exhausted platform=%s account_ref=%s old_status=%s new_status=cooldown status_code=%s cooldown_seconds=%d cooldown_until=%d reason_code=QUOTA_EXHAUSTED",
+                                   self._platform, stable_log_ref(f"{self._platform}-account", key), previous_health[0], status_code,
+                                   cooldown_secs, account["cooldown_until"])
+                elif failure_scope == "timeout" or status_code == 504:
+                    # 思考超时/读取超时：不扣罚账号健康度，不增加账号 failure_count，不增加代理失败，不进入冷却，保留会话绑定
+                    logger.info("event=thinking_timeout_exempted platform=%s account_ref=%s status_code=504",
+                                self._platform, stable_log_ref(f"{self._platform}-account", key))
                 elif failure_scope == "transport":
-                    batch["probing"] = True
+                    # DNS/TCP/代理建联失败在一次同账号重试后冷却 5 秒；已领取请求仍继续收尾。
+                    account["status"] = "cooldown"
+                    account["cooldown_until"] = max(
+                        float(account.get("cooldown_until", 0) or 0), time.time() + 5
+                    )
+                    account["error_message"] = "network_connect_failed"
+                    account["failure_count"] = account.get("failure_count", 0) + 1
+                    batch["explicit"] = True
+                    self._save_health(key)
                     if account.get("proxy_id"):
                         proxy_ref = proxy_log_ref(account)
                         future = self._health_executor.submit(database.record_proxy_failure, account["proxy_id"])
@@ -693,9 +802,16 @@ class BaseAccountPool:
         return True
 
     def _select_strategy(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
-        """优先派发给最近最少使用的账号；同等时优先较少在途请求。"""
+        """按十分钟调用量、在途数、失败数、最久未派单依次选择。"""
+        if self._platform == "doubao":
+            return min(candidates, key=lambda account: (
+                account.get("last_dispatched_at", 0.0), account.get("inflight", 0),
+            ))
+        counts = self.__dict__.get("_model_call_counts", {})
         return min(candidates, key=lambda account: (
-            account.get("last_dispatched_at", 0.0), account.get("inflight", 0),
+            counts.get(account.get("account_id") or account.get("name") or account.get("email"), 0),
+            account.get("inflight", 0), account.get("failure_count", 0),
+            account.get("last_dispatched_at", 0.0),
         ))
 
     def _mask_sensitive(self, account: dict[str, Any]) -> dict[str, Any]:
@@ -703,7 +819,7 @@ class BaseAccountPool:
         return account
 
     def _classify_error(self, error: str, status_code: int | None = None) -> str:
-        """Classify an error. Return 'fatal', 'rate_limit', or 'transient'.
+        """Classify an error. Return 'fatal', 'rate_limit', 'quota_exhausted', or 'transient'.
         Override per provider for provider-specific error keywords.
         """
         lower = error.lower()
@@ -713,9 +829,14 @@ class BaseAccountPool:
             "未认证", "登录失效", "cookie 无效", "cookie无效",
         )):
             return "fatal"
+        # 真额度耗尽、图片生成上限或上传文件保护：统一按文案识别，避免只命中有限关键词。
+        from utils.helper import detect_quota_exhausted
+        is_quota, _ = detect_quota_exhausted(error)
+        if is_quota:
+            return "quota_exhausted"
+        # 普通 429 频控限流
         if status_code == 429 or any(kw in lower for kw in (
-            "quota", "rate limit", "too many", "429", "insufficient_quota", "quota exhausted",
-            "quota exceeded", "credits exhausted", "额度不足", "额度耗尽",
+            "rate limit", "too many", "429", "throttled", "temporarily blocked",
         )):
             return "rate_limit"
         return "transient"

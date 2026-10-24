@@ -11,7 +11,7 @@ from core.router import resolve_model
 from core.model_timeout import MODEL_TIMEOUT_SECONDS
 from core.admission import CapacityUnavailable
 from core.slot_sessions import CURRENT_SESSION, ConversationUnavailable, slot_sessions
-from core.account_pool import AccountUnavailable
+from core.account_pool import AccountUnavailable, BoundAccountCooldownError
 from api.model_execution import acquire_traced_account, execute_model_request
 from providers.doubao.account import doubao_account_service
 from providers.doubao.backend import DoubaoBackendAPI
@@ -21,7 +21,9 @@ from providers.openai.account import account_service
 from providers.openai.backend import OpenAIBackendAPI
 from providers.openai.credentials import CredentialUnavailable
 from providers.gemini.webapi.exceptions import AuthError, ModelInvalidError, TemporarilyBlockedError, UsageLimitExceededError
-from utils.helper import ImageQuotaExceededError, UpstreamHTTPError, is_transport_error
+from utils.helper import (ImageDownloadError, ImageQuotaExceededError, QuotaExhaustedError,
+                          UpstreamHTTPError, detect_quota_exhausted,
+                          is_connect_error, is_transport_error, is_read_timeout_error)
 from utils.image_binary import image_media_type
 from utils.image_ratio import build_ratio_prompt
 from utils.log import error_http_status, image_stage, logger, proxy_log_ref, python_attempt_log_context, stable_log_ref
@@ -38,6 +40,8 @@ class ImageResultError(RuntimeError):
 def _failure_scope(exc: Exception) -> str:
     if isinstance(exc, ImageResultError):
         return "invalid_output"
+    if is_read_timeout_error(exc) or isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "timeout"
     return "transport" if is_transport_error(exc) else "non_transport"
 
 
@@ -54,6 +58,46 @@ def _checked_image(images, platform: str) -> bytes:
     return image
 
 
+def _cooldown_http_error(exc: BoundAccountCooldownError, platform: str) -> HTTPException:
+    import json
+    err_msg = (exc.error_message or "").lower()
+    is_network = err_msg == "network_connect_failed"
+    is_quota = exc.remaining_seconds > 300 or any(
+        kw in err_msg for kw in ("quota", "upload_protection", "上限", "额度")
+    )
+    if is_quota:
+        wait_sec = exc.remaining_seconds
+        wait_min = max(1, wait_sec // 60)
+        detail = {
+            "code": "ACCOUNT_QUOTA_EXHAUSTED",
+            "retry_after": wait_sec,
+            "retryAfter": wait_sec,
+            "message": f"当前账号额度已耗尽，预计将在 {wait_min} 分钟后恢复。可等待恢复或确认切换账号。"
+        }
+        code = "ACCOUNT_QUOTA_EXHAUSTED"
+    elif is_network:
+        wait_sec = exc.remaining_seconds
+        detail = {"code": "ACCOUNT_NETWORK_COOLDOWN", "retry_after": wait_sec,
+                  "retryAfter": wait_sec, "message": f"账号网络连接失败，已冷却 5 秒，请稍后重试或确认切换账号。"}
+        code = "ACCOUNT_NETWORK_COOLDOWN"
+    else:
+        wait_sec = exc.remaining_seconds
+        detail = {
+            "code": "ACCOUNT_RATE_LIMITED",
+            "retry_after": wait_sec,
+            "retryAfter": wait_sec,
+            "message": f"当前账号限流，请等待冷却结束或确认切换账号（剩余 {wait_sec} 秒）。"
+        }
+        code = "ACCOUNT_RATE_LIMITED"
+    return HTTPException(
+        status_code=429,
+        detail=json.dumps({**detail, "code": code, "platform": platform, "reason": code,
+                           "userActions": ["WAIT", "SWITCH_ACCOUNT"],
+                           "cooldownUntil": int(exc.cooldown_until), "upstreamState": "NOT_SENT"}, ensure_ascii=False),
+        headers={"Retry-After": str(wait_sec)}
+    )
+
+
 async def _acquire_image_account(service, platform: str, key_field: str, attempt: int):
     """有槽位时优先指定账号，忙碌只等待，需人工恢复才切换。"""
     session = CURRENT_SESSION.get()
@@ -66,18 +110,15 @@ async def _acquire_image_account(service, platform: str, key_field: str, attempt
                 account_id=preferred, excluded_account_ids=session.excluded_account_ids if session else None)
             session.account_hint = account["account_id"]
             return account
+        except BoundAccountCooldownError as exc:
+            raise _cooldown_http_error(exc, platform) from exc
         except AccountUnavailable:
-            if session is None:
-                raise
-            if preferred is not None:
-                session.excluded_account_ids.add(preferred)
-                await session.forget()
+            # 原绑定账号需要人工确认后才能切换，Python 不静默删除槽位绑定。
+            raise
         except CredentialUnavailable:
             if session is not None and preferred is not None:
                 if not service.account_is_recoverable(preferred):
-                    session.excluded_account_ids.add(preferred)
-                    await session.forget()
-                    continue
+                    raise AccountUnavailable("Bound account requires manual recovery")
                 # 自动刷新/凭证写库尚未完成，仍等待同账号，不把它当成人工失效。
                 raise CapacityUnavailable() from None
             raise
@@ -97,31 +138,7 @@ def _session_options(account: dict) -> dict:
 
 
 async def _retry_session_rejection(exc: Exception, platform: str) -> bool:
-    """仅对确定未生成的账号/会话拒绝重选，不重放超时或下载失败。"""
-    session = CURRENT_SESSION.get()
-    if session is None:
-        return False
-    if isinstance(exc, (ImageQuotaExceededError, TemporarilyBlockedError, UsageLimitExceededError)) or (
-        isinstance(exc, UpstreamHTTPError) and exc.status_code == 429
-        and exc.context != "download_image_bytes" and "/download" not in exc.context
-    ):
-        # 明确拒绝且没有生成：保留原账号会话，下一次领取等待其冷却恢复。
-        return True
-    if isinstance(exc, ConversationUnavailable) or (
-        isinstance(exc, ModelInvalidError) and "conversation history" in str(exc).lower()
-    ):
-        account_id = session.account_id
-        await session.forget()
-        session.account_hint = account_id
-        return True
-    auth_rejected = (isinstance(exc, (AccountUnavailable, AuthError))
-                     or isinstance(exc, UpstreamHTTPError) and exc.status_code == 401
-                     and exc.context != "download_image_bytes" and "/download" not in exc.context)
-    if auth_rejected:
-        if session.account_id is not None:
-            session.excluded_account_ids.add(session.account_id)
-        await session.forget()
-        return True
+    """账号与会话错误交给 Java 展示原因；Python 不自动换号或重建会话。"""
     return False
 
 
@@ -134,9 +151,11 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
                     request_id, attempt, account_ref, proxy_ref)
         upstream_started = time.monotonic()
         try:
-            async with GeminiBackendAPI(account, before_model_send=lambda: gemini_account_service.wait_for_model_send(account)) as backend:
+            async with GeminiBackendAPI(account,
+                    before_model_send=lambda: gemini_account_service.wait_for_model_send(account),
+                    after_model_send=lambda: gemini_account_service.record_model_call(account)) as backend:
                 images = await backend.image(prompt, resolved.model, body.images, body.aspect_ratio,
-                                              **_session_options(account))
+                                              **_session_options(account), thinking_level="low")
             image = _checked_image(images, "gemini")
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gemini account_ref=%s proxy_ref=%s duration_ms=%d",
                         request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000))
@@ -150,11 +169,15 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
             logger.warning("event=upstream_attempt_finished outcome=failed request_id=%s python_attempt=%d platform=gemini account_ref=%s proxy_ref=%s duration_ms=%d reason_code=%s http_status=%s failure_scope=%s transport_code=%s",
                            request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000),
                            getattr(exc, "reason_code", type(exc).__name__), error_http_status(exc), _failure_scope(exc), getattr(exc, "code", None))
+            st_code = 504 if is_read_timeout_error(exc) or isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else (
+                401 if isinstance(exc, AuthError) else 429
+                if isinstance(exc, (TemporarilyBlockedError, UsageLimitExceededError))
+                else error_http_status(exc)
+            )
             gemini_account_service.release_account(
                 account["name"], False, "" if isinstance(exc, (ImageResultError, ConversationUnavailable)) else str(exc),
-                status_code=(401 if isinstance(exc, AuthError) else 429
-                             if isinstance(exc, (TemporarilyBlockedError, UsageLimitExceededError))
-                             else error_http_status(exc)),
+                status_code=st_code,
+                retry_after=getattr(exc, "retry_after", None),
                 task_type="image", failure_scope=_failure_scope(exc), acquired_account=account,
             )
             raise
@@ -191,8 +214,10 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
             logger.warning("event=upstream_attempt_finished outcome=failed request_id=%s python_attempt=%d platform=doubao account_ref=%s proxy_ref=%s duration_ms=%d reason_code=%s http_status=%s failure_scope=%s transport_code=%s",
                            request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000),
                            getattr(exc, "reason_code", type(exc).__name__), error_http_status(exc), _failure_scope(exc), getattr(exc, "code", None))
+            st_code = 504 if is_read_timeout_error(exc) or isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else error_http_status(exc)
             doubao_account_service.release_account(
-                account["name"], False, "" if isinstance(exc, ImageResultError) else str(exc), status_code=error_http_status(exc),
+                account["name"], False, "" if isinstance(exc, ImageResultError) else str(exc), status_code=st_code,
+                retry_after=getattr(exc, "retry_after", None),
                 task_type="image", failure_scope=_failure_scope(exc), acquired_account=account,
             )
             raise
@@ -206,9 +231,11 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
         try:
             async with OpenAIBackendAPI(account["access_token"], account.get("proxy", ""), account.get("device_id", ""),
                     credential_provider=lambda: account_service.prepare_request_account(account),
-                    before_model_send=lambda: account_service.wait_for_model_send(account)) as backend:
+                    before_model_send=lambda: account_service.wait_for_model_send(account),
+                    after_model_send=lambda: account_service.record_model_call(account)) as backend:
                 images = await backend.generate_image_bytes(prompt, resolved.model, references=body.images,
-                                                            expected_count=1, **_session_options(account))
+                                                            expected_count=1, **_session_options(account),
+                                                            thinking_level=body.thinking_level)
             image = _checked_image(images, "gpt")
             account_service.release_account(account["email"], True, task_type="image", acquired_account=account)
             logger.info("event=upstream_attempt_finished outcome=success request_id=%s python_attempt=%d platform=gpt account_ref=%s proxy_ref=%s duration_ms=%d",
@@ -222,8 +249,9 @@ async def _generate_images_once(body: ImageGenerationRequest, resolved, prompt: 
             logger.warning("event=upstream_attempt_finished outcome=failed request_id=%s python_attempt=%d platform=gpt account_ref=%s proxy_ref=%s duration_ms=%d reason_code=%s http_status=%s failure_scope=%s transport_code=%s",
                            request_id, attempt, account_ref, proxy_ref, int((time.monotonic() - upstream_started) * 1000),
                            getattr(exc, "reason_code", type(exc).__name__), error_http_status(exc), _failure_scope(exc), getattr(exc, "code", None))
+            st_code = 504 if is_read_timeout_error(exc) or isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else error_http_status(exc)
             account_service.release_account(
-                account["email"], False, "" if isinstance(exc, ImageResultError) else str(exc), status_code=error_http_status(exc),
+                account["email"], False, "" if isinstance(exc, ImageResultError) else str(exc), status_code=st_code,
                 retry_after=getattr(exc, "retry_after", None), task_type="image",
                 failure_scope=_failure_scope(exc), acquired_account=account,
             )
@@ -241,18 +269,12 @@ async def generate_images(body: ImageGenerationRequest, request: Request):
 
 
 async def _generate_images(body: ImageGenerationRequest):
-    # 临时拼图覆盖两次模型尝试，最终一定释放，不被普通缓存淘汰。
-    from utils.oss_reference import release_memory_references
-    memory_keys = []
-    try:
-        platform = resolve_model(body.model, "image").platform
-        async with slot_sessions.claim(body.task_code, body.item_id, platform):
-            return await _generate_images_prepared(body, memory_keys)
-    finally:
-        release_memory_references(memory_keys)
+    platform = resolve_model(body.model, "image").platform
+    async with slot_sessions.claim(body.task_code, body.item_id, platform):
+        return await _generate_images_prepared(body)
 
 
-async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: list[str]):
+async def _generate_images_prepared(body: ImageGenerationRequest):
     resolved = resolve_model(body.model, "image")
     prompt = build_ratio_prompt(body.prompt, body.aspect_ratio)
     request_id = body.request_id or uuid.uuid4().hex
@@ -263,53 +285,7 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
         body.stage, resolved.platform, resolved.model, len(body.images),
     )
 
-    if len(body.images) > 0:
-        preprocess_started = time.monotonic()
-        try:
-            from concurrent.futures import ThreadPoolExecutor
-            from utils.oss_reference import read_oss_reference, put_memory_reference
-            from utils.image_stitch import stitch_images_to_bytes
-            
-            def remember(data):
-                key = put_memory_reference(data)
-                memory_keys.append(key)
-                return key
-
-            def process_images(images, stage):
-                with ThreadPoolExecutor(max_workers=min(10, len(images))) as executor:
-                    dimensions = [2048] * len(images)
-                    # 仅在单图调整和套图批量调整中，若参考图大于1张，则对参考图按 768 尺寸读取以准备拼图
-                    if len(images) > 2 and stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
-                        dimensions = [2048] + [768] * (len(images) - 1)
-                    bytes_list = list(executor.map(read_oss_reference, images, dimensions))
-                    
-                # 仅针对单图与套图调整阶段进行控图拼接（第1张基底图保持独立，第2~N张参考图拼为一张）
-                if len(images) > 2 and stage in ("SINGLE_ADJUST_GENERATION", "SUITE_ADJUST_GENERATION"):
-                    base_img_bytes = bytes_list[0]
-                    stitched = stitch_images_to_bytes(bytes_list[1:])
-                    return [remember(base_img_bytes), remember(stitched)]
-                        
-                # 初版生图 (INITIAL_IMAGE_GENERATION) 或未超限图片直接保持独立原图
-                return [remember(b) for b in bytes_list]
-                
-            preparation = asyncio.create_task(asyncio.to_thread(process_images, body.images, body.stage))
-            try:
-                new_images = await asyncio.shield(preparation)
-            except asyncio.CancelledError:
-                # 线程不能强行取消；等它结束后由外层 finally 释放其临时图片。
-                await asyncio.gather(preparation, return_exceptions=True)
-                raise
-            if new_images != body.images:
-                logger.info("event=images_processed request_id=%s old_count=%d new_count=%d duration_ms=%d",
-                            request_id, len(body.images), len(new_images), int((time.monotonic() - preprocess_started) * 1000))
-                body = body.model_copy(update={"images": new_images})
-        except Exception as e:
-            logger.warning("event=image_process_failed request_id=%s reason_code=%s duration_ms=%d",
-                           request_id, type(e).__name__, int((time.monotonic() - preprocess_started) * 1000))
-            raise HTTPException(status_code=502, detail="Reference image preparation failed",
-                                headers={"X-Request-ID": request_id}) from e
-
-    for attempt in range(2):
+    for attempt in range(1):
         try:
             # 账号池内部的健康变化日志也归到本次 Python 上游尝试。
             attempt_token = python_attempt_log_context.set(attempt + 1)
@@ -330,6 +306,10 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
                 body.stage, attempt + 1, int((time.monotonic() - started_at) * 1000),
             )
             return Response(content=raw_image, media_type=media_type, headers={"X-Request-ID": request_id})
+        except BoundAccountCooldownError as exc:
+            error = _cooldown_http_error(exc, resolved.platform)
+            error.headers["X-Request-ID"] = request_id
+            raise error from exc
         except CapacityUnavailable:
             logger.warning("event=image_request_failed request_id=%s platform=%s python_attempt=%d reason_code=NO_CAPACITY", request_id, resolved.platform, attempt + 1)
             raise
@@ -337,24 +317,117 @@ async def _generate_images_prepared(body: ImageGenerationRequest, memory_keys: l
             logger.warning("event=image_request_failed request_id=%s platform=%s python_attempt=%d reason_code=CredentialUnavailable", request_id, resolved.platform, attempt + 1)
             raise HTTPException(status_code=502, detail="GPT credential preparation failed",
                                 headers={"X-Request-ID": request_id}) from exc
+        except HTTPException:
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if attempt == 0 and (resolved.platform == "doubao" or await _retry_session_rejection(exc, resolved.platform)):
-                logger.warning(
-                    "event=image_attempt_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=1 max_attempts=2 reason=%s",
-                    request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
-                    body.stage, resolved.platform, type(exc).__name__,
-                )
-                await asyncio.sleep(1)
-                continue
             logger.error(
-                "event=image_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=%d max_attempts=2 elapsed_ms=%d reason=%s",
+                "event=image_request_failed request_id=%s dispatch_id=%s task_code=%s operation_id=%s item_id=%s stage=%s platform=%s python_attempt=%d max_attempts=1 elapsed_ms=%d reason=%s",
                 request_id, body.dispatch_id, body.task_code, body.operation_id, body.item_id,
                 body.stage, resolved.platform, attempt + 1, int((time.monotonic() - started_at) * 1000), type(exc).__name__,
             )
+
+            # 精准识别限流与额度耗尽异常，透传结构化 429 与倒计时，保留槽位供用户选择
+            from utils.helper import ImageQuotaExceededError, UpstreamHTTPError
+            from providers.gemini.webapi.exceptions import TemporarilyBlockedError, UsageLimitExceededError
+            import json
+
+            err_str = str(exc).lower()
+            if isinstance(exc, (AccountUnavailable, AuthError)) or (
+                isinstance(exc, UpstreamHTTPError) and exc.status_code == 401
+            ):
+                raise HTTPException(status_code=401, detail=json.dumps({
+                    "code": "ACCOUNT_AUTH_INVALID", "reason": "ACCOUNT_AUTH_INVALID",
+                    "platform": resolved.platform,
+                    "message": "当前绑定账号登录状态失效，需要更新凭证或确认切换账号。",
+                    "userActions": ["UPDATE_CREDENTIALS", "SWITCH_ACCOUNT"],
+                    "upstreamState": "UNKNOWN",
+                }, ensure_ascii=False), headers={"X-Request-ID": request_id}) from exc
+            if isinstance(exc, ConversationUnavailable) or (
+                isinstance(exc, ModelInvalidError) and "conversation history" in err_str
+            ):
+                raise HTTPException(status_code=409, detail=json.dumps({
+                    "code": "CONVERSATION_UNAVAILABLE", "reason": "CONVERSATION_UNAVAILABLE",
+                    "platform": resolved.platform,
+                    "message": "当前会话无法继续，可在详情查看原因并选择使用原账号新建会话重试。",
+                    "userActions": ["RETRY_NEW_CONVERSATION"], "upstreamState": "SUBMITTED",
+                }, ensure_ascii=False), headers={"X-Request-ID": request_id}) from exc
+            is_quota = isinstance(exc, (ImageQuotaExceededError, QuotaExhaustedError, UsageLimitExceededError)) or (
+                detect_quota_exhausted(str(exc))[0]
+            ) or any(
+                kw in err_str for kw in ("quota", "upload_protection", "上限", "额度")
+            )
+            is_rate = isinstance(exc, TemporarilyBlockedError) or (
+                isinstance(exc, UpstreamHTTPError) and exc.status_code == 429
+            )
+
+            if is_quota or is_rate:
+                retry_after = getattr(exc, "retry_after", None)
+                if is_quota:
+                    # 优先异常自带时间，其次从文本提取恢复时间，都没有则默认 5 小时。
+                    _, detected_seconds = detect_quota_exhausted(str(exc))
+                    wait_sec = (retry_after if retry_after and retry_after > 0
+                                else detected_seconds if detected_seconds and detected_seconds > 0
+                                else 18000)
+                    wait_min = max(1, wait_sec // 60)
+                    detail = {
+                        "code": "ACCOUNT_QUOTA_EXHAUSTED",
+                        "retry_after": wait_sec,
+                        "retryAfter": wait_sec,
+                        "cooldownUntil": int(time.time()) + wait_sec,
+                        "message": f"当前账号额度已耗尽，预计将在 {wait_min} 分钟后恢复。可等待恢复或确认切换账号。"
+                    }
+                else:
+                    wait_sec = 120
+                    detail = {
+                        "code": "ACCOUNT_RATE_LIMITED",
+                        "retry_after": wait_sec,
+                        "retryAfter": wait_sec,
+                        "cooldownUntil": int(time.time()) + wait_sec,
+                        "message": "当前账号受到限流，请等待冷却结束或确认切换账号。"
+                    }
+                raise HTTPException(
+                    status_code=429,
+                    detail=json.dumps({**detail, "platform": resolved.platform}, ensure_ascii=False),
+                    headers={"X-Request-ID": request_id, "Retry-After": str(wait_sec)}
+                )
+
+            stage = getattr(exc, "image_stage", "model_request")
+            if isinstance(exc, ImageDownloadError):
+                raise HTTPException(status_code=502, detail=json.dumps({
+                    "code": "IMAGE_DOWNLOAD_FAILED", "platform": resolved.platform,
+                    "stage": "image_download", "message": str(exc),
+                    "upstreamState": "IMAGE_READY", "userActions": ["RETRY_DOWNLOAD"],
+                }, ensure_ascii=False), headers={"X-Request-ID": request_id}) from exc
+
+            # 已提交生成后读取超时不能自动重发图片生成；明确返回失败阶段给 Java 展示。
+            from utils.helper import is_read_timeout_error
+            if is_read_timeout_error(exc) or isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or getattr(exc, "status_code", None) == 504:
+                raise HTTPException(
+                    status_code=504, detail=json.dumps({
+                        "code": "IMAGE_READ_TIMEOUT", "platform": resolved.platform, "stage": stage,
+                        "message": f"模型请求读取超时（阶段：{stage}），未自动重新提交生图。",
+                        "upstreamState": "SUBMITTED", "userActions": ["RETRY_IMAGE"],
+                    }, ensure_ascii=False),
+                    headers={"X-Request-ID": request_id},
+                ) from exc
+
+            if is_connect_error(exc) or (is_transport_error(exc) and stage in {"model_request", "image_submit"}):
+                raise HTTPException(status_code=502, detail=json.dumps({
+                    "code": "ACCOUNT_NETWORK_COOLDOWN", "platform": resolved.platform,
+                    "retryAfter": 5, "cooldownUntil": int(time.time()) + 5,
+                    "message": "账号网络连接重试一次后仍失败，已冷却 5 秒；上游未确认接收本次生图请求。",
+                    "upstreamState": "NOT_SENT", "userActions": ["WAIT", "SWITCH_ACCOUNT"],
+                }, ensure_ascii=False), headers={"X-Request-ID": request_id}) from exc
+
+            # 其余错误统一对外收敛报错为：模型生成失败
             raise HTTPException(
-                status_code=502, detail=f"{resolved.platform} image generation failed: {exc}",
+                status_code=502, detail=json.dumps({
+                    "code": "MODEL_GENERATION_FAILED", "platform": resolved.platform, "stage": stage,
+                    "message": f"模型生成失败（阶段：{stage}）。",
+                    "upstreamState": "SUBMITTED", "userActions": ["VIEW_DETAILS", "RETRY_IMAGE"],
+                }, ensure_ascii=False),
                 headers={"X-Request-ID": request_id},
             ) from exc
 

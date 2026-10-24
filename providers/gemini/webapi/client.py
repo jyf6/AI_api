@@ -303,7 +303,8 @@ class GeminiClient(ChatMixin, GemMixin, ResearchMixin):
                     verify=self.kwargs.get("verify", True),
                 )
 
-                init_session.client.timeout = timeout
+                # HTTP建联预算与模型数值预算分开，避免watchdog对元组做数值运算。
+                init_session.client.timeout = (15, timeout)
                 self.client = init_session.client
                 self._cookie_source = init_session.cookie_source
                 self._cookies.update(self.client.cookies)

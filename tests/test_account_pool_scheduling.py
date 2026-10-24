@@ -5,7 +5,7 @@ from threading import Condition, Lock
 
 import pytest
 
-from core.account_pool import AccountUnavailable
+from core.account_pool import AccountUnavailable, BoundAccountCooldownError
 from core.admission import CapacityUnavailable
 
 
@@ -59,14 +59,15 @@ def test_preferred_disabled_or_missing_account_is_not_a_capacity_wait():
     asyncio.run(scenario())
 
 
-def test_preferred_cooldown_waits_and_recovers_without_switch():
+def test_preferred_cooldown_returns_reason_without_sending():
     async def scenario():
         pool = make_pool()
         pool._accounts["a"]["cooldown_until"] = time.time() + .08
         started = asyncio.get_running_loop().time()
-        result = await pool.acquire_account("image", account_id=1)
-        assert result["account_id"] == 1
-        assert asyncio.get_running_loop().time() - started >= .07
+        with pytest.raises(BoundAccountCooldownError) as caught:
+            await pool.acquire_account("image", account_id=1)
+        assert caught.value.remaining_seconds >= 1
+        assert asyncio.get_running_loop().time() - started < .05
         assert pool._accounts["b"]["inflight"] == 0
     asyncio.run(scenario())
 
@@ -84,23 +85,92 @@ def test_actual_model_send_is_spaced_across_image_and_chat():
     asyncio.run(scenario())
 
 
-def test_cooldown_set_after_acquisition_still_blocks_actual_send():
+def test_cooldown_set_after_acquisition_blocks_actual_send():
     async def scenario():
         pool = make_pool()
         account = await pool.acquire_account("image", account_id=1)
         pool._accounts["a"]["cooldown_until"] = time.time() + .08
-        started = asyncio.get_running_loop().time()
-        await pool.wait_for_model_send(account)
-        assert asyncio.get_running_loop().time() - started >= .07
+        with pytest.raises(BoundAccountCooldownError):
+            await pool.wait_for_model_send(account)
     asyncio.run(scenario())
 
 
-def test_scheduler_prefers_least_recently_dispatched_then_lower_inflight():
-    pool = BaseAccountPool.__new__(BaseAccountPool)
-    accounts = [
-        {"name": "recent", "last_dispatched_at": 20.0, "inflight": 0},
-        {"name": "older_busy", "last_dispatched_at": 10.0, "inflight": 2},
-        {"name": "older_idle", "last_dispatched_at": 10.0, "inflight": 0},
-    ]
+def test_scheduler_prefers_low_window_calls_then_inflight_then_failures():
+    pool = make_pool()
+    pool._model_call_counts = {1: 10, 2: 3}
+    a, b = pool._accounts.values()
+    a.update(failure_count=0, inflight=3)
+    b.update(failure_count=1, inflight=0)
+    assert pool._select_strategy([a, b]) is b
+    b["failure_count"] = 0
+    assert pool._select_strategy([a, b]) is b
+    pool._model_call_counts[1] = 3
+    assert pool._select_strategy([a, b]) is b
+    a["inflight"] = 0
+    a["last_dispatched_at"], b["last_dispatched_at"] = 1, 2
+    assert pool._select_strategy([a, b]) is a
 
-    assert pool._select_strategy(accounts)["name"] == "older_idle"
+
+def test_gpt_and_gemini_use_two_point_five_seconds_at_both_gates():
+    assert BaseAccountPool.MIN_DISPATCH_INTERVAL_SECONDS == 2.5
+    pool = make_pool()
+    pool.MIN_DISPATCH_INTERVAL_SECONDS = 2.5
+    pool._accounts.pop("b")
+    assert pool._reserve_available_account("chat") is not None
+    assert pool._reserve_available_account("image") is None
+
+
+def test_long_cooldown_after_reservation_returns_reason_without_sending():
+    async def scenario():
+        pool = make_pool()
+        account = await pool.acquire_account("image", account_id=1)
+        until = time.time() + 60.2
+        pool._accounts["a"].update(cooldown_until=until, error_message="rate limit 429")
+        with pytest.raises(BoundAccountCooldownError) as caught:
+            await pool.wait_for_model_send(account)
+        assert caught.value.cooldown_until == until
+        assert caught.value.remaining_seconds == 61
+        assert caught.value.error_message == "rate limit 429"
+        assert not pool.__dict__.get("_model_call_counts")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("platform", ["gpt", "gemini"])
+def test_total_model_calls_survive_pool_restart_and_do_not_count_reservations(monkeypatch, platform):
+    from core.slot_sessions import slot_sessions
+
+    class RedisCounters:
+        def __init__(self):
+            self.hashes = {}
+
+        async def hgetall(self, key):
+            return {k.encode(): str(v).encode() for k, v in self.hashes.get(key, {}).items()}
+
+        async def hincrby(self, key, field, increment):
+            values = self.hashes.setdefault(key, {})
+            values[field] = values.get(field, 0) + increment
+            return values[field]
+
+        async def expire(self, *_):
+            return True
+
+    async def scenario():
+        redis = RedisCounters()
+        monkeypatch.setattr(slot_sessions, "redis", redis)
+        first = make_pool()
+        first._platform = platform
+        account = await first.acquire_account("chat", account_id=1)
+        assert not redis.hashes
+        await first.wait_for_model_send(account)
+        assert not redis.hashes
+        await first.record_model_call(account)
+        await first.record_model_call(account)
+        window_key = f"flexi:ai:account-model-calls:{platform}:{int(time.time() // 600)}"
+        assert redis.hashes[window_key] == {"1": 2}
+        restarted = make_pool()
+        restarted._platform = platform
+        assert (await restarted.acquire_account("image"))["account_id"] == 2
+        assert restarted._model_call_counts[1] == 2
+        # 旧会话仍定向账号1，不因调用量较高切换账号。
+        assert (await restarted.acquire_account("image", account_id=1))["account_id"] == 1
+    asyncio.run(scenario())

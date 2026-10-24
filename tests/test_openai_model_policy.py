@@ -73,7 +73,7 @@ def test_gpt_policy_reaches_actual_upstream_requests(monkeypatch, action):
             if action == "health":
                 assert "thinking_effort" not in payload
             else:
-                assert payload["thinking_effort"] == "extended"
+                assert payload["thinking_effort"] == ("medium" if action == "chat" else "extended")
         message = requests[-1][1]["messages"][0]
         assert message["content"]["parts"][0]["asset_pointer"] == "file-service://reference-id"
         if action == "image":

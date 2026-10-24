@@ -149,18 +149,22 @@ class DoubaoBackendAPI:
         return {"uri": item.get("uri", uri), "cdn_url": item.get("main_url", ""), "name": filename,
                 "format": ext, "width": "0", "height": "0"}
 
-    async def chat(self, text: str, image_attachments: list[dict[str, str]] | None = None) -> str:
+    async def chat_with_context(
+        self, text: str, image_attachments: list[dict[str, str]] | None = None,
+        local_conversation_id: str | None = None, need_create_conversation: bool = True
+    ) -> tuple[str, str]:
         if not self.session:
             raise RuntimeError("Doubao client is not initialized")
+        conv_id = local_conversation_id or str(uuid.uuid4())
         payload = {"messages": [{"content": json.dumps({"text": text}, ensure_ascii=False), "content_type": 2001,
                                   "attachments": [{"type": "image", "key": item["uri"], "extra": {"refer_types": "overall"}}
                                                   for item in (image_attachments or [])], "references": []}],
-                   "completion_option": {"is_regen": False, "with_suggest": True, "need_create_conversation": True,
+                   "completion_option": {"is_regen": False, "with_suggest": True, "need_create_conversation": need_create_conversation,
                                           "launch_stage": 1, "is_replace": False, "is_delete": False,
                                           "is_ai_playground": False, "memory_type": 2, "message_from": 0,
                                           "use_deep_think": False, "use_auto_cot": False, "resend_for_regen": False,
                                           "enable_commerce_credit": False}, "evaluate_option": {"web_ab_params": ""},
-                   "local_conversation_id": str(uuid.uuid4()), "local_message_id": str(uuid.uuid4())}
+                   "local_conversation_id": conv_id, "local_message_id": str(uuid.uuid4())}
         url = self.BASE_URL + "/samantha/chat/completion"
         headers = {"Accept": "text/event-stream", "Content-Type": "application/json",
                    "x-tt-passport-csrf-token": self.cookies.get("passport_csrf_token", "")}
@@ -188,7 +192,11 @@ class DoubaoBackendAPI:
                 continue
         if not text_parts:
             raise RuntimeError("Doubao chat returned no text")
-        return "".join(text_parts)
+        return "".join(text_parts).strip(), conv_id
+
+    async def chat(self, text: str, image_attachments: list[dict[str, str]] | None = None) -> str:
+        text, _ = await self.chat_with_context(text, image_attachments)
+        return text
 
     async def generate_image(self, prompt: str, ratio: str = "1:1", image_attachments: list[dict[str, str]] | None = None) -> list[str]:
         if not self.session:

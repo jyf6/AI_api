@@ -22,6 +22,9 @@ class RedisMemory:
     async def delete(self, key):
         self.values.pop(key, None)
 
+    async def exists(self, key):
+        return key in self.values
+
 
 def test_current_session_survives_image_failure_and_new_cache_instance():
     async def scenario():

@@ -1,8 +1,7 @@
-"""单进程模型执行额度；平台与全局额度在同一条件锁下领取。"""
+"""模型请求生命周期计数；实际容量由每个账号的并发槽位控制。"""
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -101,13 +100,10 @@ class ExecutionPermit:
 class ModelAdmission:
     PLATFORMS = ("gpt", "gemini", "doubao")
 
-    def __init__(self, limits: Mapping[str, int], global_limit: int) -> None:
-        if set(limits) != set(self.PLATFORMS):
-            raise ValueError("All three platform limits must be configured")
-        if any(type(value) is not int or value <= 0 for value in (*limits.values(), global_limit)):
-            raise ValueError("Model execution limits must be positive integers")
-        self.limits = dict(limits)
-        self.global_limit = global_limit
+    def __init__(self, limits: Mapping[str, int] | None = None, global_limit: int | None = None) -> None:
+        # 保留生命周期统计接口兼容性，不以平台或全局总量阻塞请求。
+        self.limits = dict.fromkeys(self.PLATFORMS, 2**31 - 1)
+        self.global_limit = 2**31 - 1
         self._condition = asyncio.Condition()
         self._reserved = dict.fromkeys(self.PLATFORMS, 0)
         self._running = dict.fromkeys(self.PLATFORMS, 0)
@@ -116,9 +112,8 @@ class ModelAdmission:
 
     @classmethod
     def from_environment(cls) -> ModelAdmission:
-        # 缺失配置时采用默认并发额度（支持防空字符串）
-        return cls({platform: int(os.environ.get(f"{platform.upper()}_LIMIT") or 100)
-                    for platform in cls.PLATFORMS}, int(os.environ.get("MODEL_GLOBAL_LIMIT") or 150))
+        # 并发上限只在账号池中设置，避免环境变量造成第二层总量瓶颈。
+        return cls()
 
     async def acquire(self, platform: str, deadline: float) -> ExecutionPermit:
         if platform not in self.limits:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from utils.image_ratio import parse_and_normalize_ratio
 
@@ -11,7 +11,8 @@ from utils.image_ratio import parse_and_normalize_ratio
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="生成图片的提示词")
     model: str = "gpt-image"
-    aspect_ratio: str = Field(..., description="约分后的宽高比，如 3:4")
+    thinking_level: Literal["medium", "high"] = "high"
+    aspect_ratio: str = Field(..., description="宽高比，如 3:4 或 1200:1600（不做约分）")
     images: list[str] = Field(default_factory=list, description="参考图的 OSS objectKey 或 HTTP/HTTPS URL 列表")
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     # Java 对同一 request_id 重发时的序号；其他调用方可以不传。
@@ -38,10 +39,9 @@ class OAuthCallbackRequest(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str = "gpt-chat"
+    thinking_level: Literal["medium", "high"] = "medium"
     prompt: str = Field(..., min_length=1)
     images: list[str] = Field(default_factory=list, description="参考图的 OSS objectKey 或 HTTP/HTTPS URL 列表")
-    # images 前 N 张为待拼接参考图；其余产品九宫格保持独立。
-    reference_image_count: int | None = Field(default=None, ge=0)
     request_id: str = Field(default="", max_length=100, pattern=r"^[A-Za-z0-9._:-]*$")
     java_attempt: int | None = Field(default=None, ge=1)
     dispatch_id: int | None = None
@@ -49,13 +49,6 @@ class ChatCompletionRequest(BaseModel):
     operation_id: int | None = None
     item_id: int | None = None
     stage: str = Field(default="", max_length=80, pattern=r"^[A-Za-z0-9._:-]*$")
-
-    @model_validator(mode="after")
-    def validate_reference_count(self):
-        if self.reference_image_count is not None and self.reference_image_count > len(self.images):
-            raise ValueError("reference_image_count cannot exceed images length")
-        return self
-
 
 class DoubaoAccountRequest(BaseModel):
     name: str = ""

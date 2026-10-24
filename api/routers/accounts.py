@@ -189,8 +189,8 @@ async def add_gemini_account(body: GeminiAccountRequest):
         await gemini_account_service.discard_client(body.name.strip())
         proxy, proxy_id = await run_blocking(_proxy_for_account, body.proxy_id, body.proxy)
         account = await run_blocking(gemini_account_service.add_account, body.name, body.cookie, proxy, proxy_id)
-        # 新录入 Cookie 立即建立账号级客户端；成功后自动续期任务才会常驻。
-        await gemini_account_service.get_client(account)
+        # 新录入 Cookie 在两分钟内通过登录检查并预热独立请求客户端。
+        await gemini_account_service.prepare_account(account["name"])
         return {"name": account["name"], "status": account["status"]}
     except Exception as exc:
         if "account" in locals():
@@ -205,6 +205,12 @@ async def update_gemini_cookie(name: str, body: AccountCookieUpdateRequest):
         await gemini_account_service.discard_client(name)
         if not await run_blocking(gemini_account_service.update_cookie, name, body.cookie):
             raise HTTPException(status_code=404, detail="Gemini account not found")
+        account = gemini_account_service.account_snapshot(name)
+        try:
+            await gemini_account_service.prepare_account(name)
+        except Exception as exc:
+            gemini_account_service.mark_refresh_verification_failed(name, exc, expected_account=account)
+            raise
         return {"name": name, "status": "active"}
     except HTTPException:
         raise
@@ -218,6 +224,12 @@ async def bind_gemini_proxy(name: str, body: ProxyBindingRequest):
         await gemini_account_service.discard_client(name)
         if not await run_blocking(gemini_account_service.set_account_proxy, name, body.proxy_id):
             raise HTTPException(status_code=404, detail="Gemini account not found")
+        account = gemini_account_service.account_snapshot(name)
+        try:
+            await gemini_account_service.prepare_account(name)
+        except Exception as exc:
+            gemini_account_service.mark_refresh_verification_failed(name, exc, expected_account=account)
+            raise
         return {"name": name, "proxy_id": body.proxy_id}
     except HTTPException:
         raise
